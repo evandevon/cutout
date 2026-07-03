@@ -1,0 +1,2500 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+  SNIP & SHIFT — v1
+  ==================
+  Single-file browser tool for pasting an image, cropping it, removing the
+  background (PowerPoint-style manual marking, no ML model), touching up the
+  cutout with a paint brush, and applying non-destructive corrections /
+  colour / artistic effects before copying or downloading a PNG.
+
+  ARCHITECTURE (mirrors the layer model used in Frame by Frame)
+  ---------------------------------------------------------------
+  - baseCanvas   (offscreen) — the working image pixels, AFTER crop, BEFORE
+                  any effects. Never touched by sliders. This is the single
+                  source of truth effects are recomputed from every time.
+  - maskCanvas   (offscreen) — alpha-only mask (RGB unused, alpha channel
+                  carries the cutout). 255 = fully kept, 0 = fully removed.
+                  Edited by: bounding box, mark-keep/mark-remove strokes,
+                  and the add/remove paint brush.
+  - displayCanvas (visible)  — the fully composited result: base image with
+                  corrections/colour/artistic effect applied, then the mask
+                  applied via 'destination-in'. Recomputed by renderComposite().
+  - overlayCanvas (visible)  — sits on top of displayCanvas, transparent.
+                  Only used to draw transient UI: crop handles, bbox rect,
+                  in-progress brush strokes. Never touches image pixels.
+
+  Corrections / Colour / Artistic effect values are stored as plain numbers
+  in `state.fx` and are NEVER baked into baseCanvas — every render rebuilds
+  the result from baseCanvas + state.fx + maskCanvas, so sliders stay live-
+  adjustable at any point, same as PowerPoint's Picture Format pane.
+
+  BACKGROUND REMOVAL ALGORITHM (see classifyRegion() and the min-cut /
+  max-flow graph engine just above it: buildGridTopology(), solveMaxFlow(),
+  extractSourceSide(), fitGmmLite(), unaryCost())
+  ---------------------------------------------------------------
+  No ML model — this is a from-scratch implementation of GrabCut, the same
+  graph min-cut algorithm PowerPoint's own (pre-AI) "Remove Background" is
+  built on (Rother/Kolmogorov/Blake, Microsoft Research, 2004), per Ev's
+  steer after v1-v12's geodesic-flood heuristic proved not aggressive or
+  reliable enough:
+  1. On image load (and whenever the optional Area box is redrawn), both
+     classes are auto-seeded with pixel COORDINATES: background from a ring
+     just outside the box (or the four canvas corners if the box fills the
+     whole image), foreground from a sparse grid across the box interior.
+     Auto Keep / Auto Remove strokes add more seed pixels to whichever
+     class you're drawing.
+  2. Every pixel in the working region becomes a node in a graph, connected
+     to its 4 neighbours (edge weight = how alike their colours are — a
+     big colour jump makes a cheap/weak edge, which is what lets the final
+     cut land there readily) and to two special terminal nodes, source
+     (foreground) and sink (background). Each pixel's terminal edge weights
+     come from a lightweight Gaussian-mixture colour model (fitGmmLite(): a
+     k-means fit over the marked seed colours, treated as isotropic
+     Gaussians) — how well a pixel matches the foreground model vs the
+     background model. Seed pixels get a near-infinite weight toward their
+     marked terminal, hard-pinning their label.
+  3. solveMaxFlow() (Dinic's algorithm) finds the cheapest possible way to
+     split the WHOLE graph into two pieces, one touching source, one
+     touching sink — a genuine global optimum over the whole region at
+     once, unlike a local flood that commits to decisions pixel-by-pixel as
+     it sweeps past. extractSourceSide() reads off the result: every node
+     still reachable from source is foreground, everything else is
+     background. This is natively a binary decision — no threshold or
+     feather is needed to make it one.
+  4. classifyRegion() repeats step 2-3 for GRABCUT_ITERATIONS passes,
+     refitting the colour models from the FULL current labelling (not just
+     the original seeds) each time — standard GrabCut-style refinement.
+  This global optimisation is what fixes the two biggest weaknesses of the
+  old geodesic approach: a same-coloured patch elsewhere in the region gets
+  folded in correctly by its colour evidence alone, with no need for a
+  cheap spatial path to a seed: and small isolated islands are intrinsically
+  expensive in this formulation (their cut perimeter usually costs more
+  than the area they'd save), so they mostly never form in the first place
+  rather than needing ad-hoc cleanup after the fact.
+  Re-marking recomputes the WHOLE region from scratch. The paint brush
+  (Keep Pen / Remove Pen) is the tool for fine manual correction afterward.
+
+  UNDO
+  ---------------------------------------------------------------
+  A capped stack (MAX_UNDO_STEPS) of maskCanvas snapshots, pushed after each
+  discrete action (bbox set, mark stroke, paint stroke). Corrections/colour/
+  artistic sliders are not part of the undo stack — they're just numbers,
+  freely adjustable, "undo" for those is simply moving the slider back.
+
+  KNOWN v1 LIMITATIONS / ON THE HORIZON
+  ---------------------------------------------------------------
+  - Paint (oil-effect) artistic filter is the heaviest op; it runs on a
+    downscaled preview while a slider is actively being dragged and at full
+    resolution ~150ms after you let go. Large pasted images may still take
+    a moment on the full-res pass.
+  - No multi-image sessions — pasting a new image resets everything.
+  - No crop-then-resize/rotate; crop is axis-aligned rectangle only.
+
+  v2 CHANGE
+  ---------------------------------------------------------------
+  Fixed: Keep/Remove marking tools were behaving identically to the
+  Restore/Erase paint brush. Cause: classifyRegion() (the actual colour-
+  based segmentation) only ran once BOTH a keep stroke and a remove stroke
+  had been drawn; until then, marks fell back to punching the mask directly
+  under the stroke — indistinguishable from the paint brush. Since the most
+  natural workflow (draw a box, paint over what you don't want) never
+  produces a keep stroke, this fallback was hit almost all the time.
+  Fix: seedInitialSamples() now auto-seeds both classes the moment the
+  bounding box is set — background from a ring just outside the box
+  (always genuinely background), foreground from a sparse grid across the
+  box interior (a rough guess, refined by real marks). So the very first
+  Keep or Remove stroke a person draws now triggers real classification.
+
+  v3 CHANGES
+  ---------------------------------------------------------------
+  - The Area (bounding box) tool is no longer required before using the
+    marking pens. seedInitialSamples() already degraded gracefully to
+    "sample the four image corners for background" when there's no
+    exterior band to sample (i.e. the box fills the canvas) — so on image
+    load we now just seed against the WHOLE canvas automatically and drop
+    straight into Auto Keep. The Area tool still exists as an optional way
+    to narrow the working region for tricky images.
+  - Renamed for clarity: the colour-classification pens (formerly
+    "Keep"/"Remove") are now "Auto Keep"/"Auto Remove". The direct paint
+    brush (formerly "Restore"/"Erase") is now "Keep Pen"/"Remove Pen".
+  - Removed pixels are now shown at ~30% opacity on screen ("Show removed
+    areas" toggle, on by default) so you can see what you're about to
+    restore. This is purely a preview layer — renderComposite() keeps the
+    clean, mask-applied result in a separate `maskedCanvas`, and that's
+    what Copy PNG / Download PNG actually export, so nothing ghost-y ends
+    up baked into your exported file.
+  - Removed the Paint strokes artistic effect (wasn't working, and was the
+    only reason the render pipeline needed a downscaled-preview / debounce
+    path — that's gone too, since everything left is cheap enough to run
+    at full resolution on every slider input).
+
+  v5 CHANGE
+  ---------------------------------------------------------------
+  Replaced the k-means colour-centroid classifier with an edge-aware
+  geodesic distance classifier (see the BACKGROUND REMOVAL ALGORITHM note
+  above and classifyRegion()/geodesicDistance()). Motivation: k-means only
+  compared each pixel's colour to a handful of centroids, with no notion of
+  *where* other pixels were or where object edges actually fell, so marks
+  didn't reliably spread through a uniform area or stop at a real edge.
+  The geodesic version floods outward from actual seed pixels along
+  cheapest-colour-difference paths, so it follows edges properly and
+  spreads aggressively through flat colour. Also added BG_DOMINANCE (biases
+  ambiguous/equidistant pixels toward removed) and an asymmetric feather
+  (weightedFeather() — a low-alpha neighbour pulls harder than a high-alpha
+  one pushes back), so confidently-transparent pixels carry more weight
+  with their neighbours than the reverse, as requested. Seeds are now
+  stored as pixel coordinates (state.fgSeeds/bgSeeds) rather than sampled
+  Lab colours, since the classifier reads colour fresh from the image when
+  it builds the cost field.
+
+  v6 CHANGE
+  ---------------------------------------------------------------
+  Fixed: small "grid dot" artefacts left behind after Auto Keep/Remove,
+  most visible around a subject against a busy background. Cause: the
+  automatic interior seed grid (see seedInitialSamples()) occasionally
+  plants a foreground seed on a patch of background peeking in near the
+  box edges — hair gaps, shoulders, the corners of a loose box — and since
+  a seed is a hard distance-0 anchor, each mis-placed one grows into its
+  own tiny, fully-isolated "kept" island once the geodesic flood runs.
+  Fix: removeSmallIslands() now runs a connected-component pass on the
+  classified alpha before feathering, and merges any region smaller than
+  MIN_ISLAND_AREA_PX into whichever class surrounds it. Real subject detail
+  is untouched, since it's part of one large connected mass rather than a
+  lone island. Also nudged the interior seed grid's edge inset out a bit
+  (INTERIOR_SEED_INSET_FRAC) to reduce how often this happens in the first
+  place.
+
+  v7 CHANGES
+  ---------------------------------------------------------------
+  - Stronger, more decisive spreading: geodesicDistance()'s edge cost now
+    has a noise floor (EDGE_NOISE_FLOOR) — colour differences below it
+    (ordinary shading/gradients/noise) cost nothing extra, so the flood
+    pushes through gentle variation (skin, fabric folds) instead of
+    gradually stalling on it. Differences above the floor (real edges) are
+    then multiplied up (EDGE_COST_SCALE), so the flood commits to stopping
+    there rather than slowly leaking across. Also lowered the flat per-step
+    floor cost and increased the sweep count (GEODESIC_PASSES) for better
+    convergence with the new cost shape.
+  - No more semi-transparent pixels, anywhere: classifyRegion() now hard-
+    binarizes the result (every pixel snaps to fully kept or fully removed)
+    after the feather/island-cleanup steps, then runs removeSmallIslands()
+    a second time on that binary result to mop up any lone specks the
+    snapping itself introduced. The feather pass still runs first, but only
+    to bias WHERE the hard boundary lands (a transparent neighbour still
+    pulls harder than an opaque one) — it's no longer the final output, so
+    it can never leave a soft edge behind. This is what removes the small
+    faded floating pixels that used to survive as isolated low/mid-alpha
+    blobs.
+
+  v8 CHANGE
+  ---------------------------------------------------------------
+  Tuned the geodesic constants further in the "spread more aggressively"
+  direction: EDGE_NOISE_FLOOR doubled (6), GEODESIC_FLOOR_COST halved
+  (0.15), EDGE_COST_SCALE raised (2.2), GEODESIC_PASSES raised to 4 for
+  better convergence now that flat-region cost is so low. No algorithm
+  changes, just pushing the same knobs from v7 further in the same
+  direction — these are the constants to keep nudging if it still isn't
+  aggressive enough, or to pull back if it starts overreaching into
+  genuinely different objects.
+
+  v9 CHANGE
+  ---------------------------------------------------------------
+  classifyRegion() no longer floods on the full-resolution image. It now
+  draws the working region down to at most COST_DOWNSAMPLE_MAX_DIM on its
+  longest side, runs a per-channel median filter (medianFilterLab(),
+  radius MEDIAN_FILTER_RADIUS) on that smaller copy, and floods the
+  geodesic distance transform there — then bilinear-upsamples the result
+  (upsampleAlpha()) back to full resolution before the existing island-
+  cleanup/feather/binarize pipeline runs. Two effects from one change:
+  downsampling averages away fine texture for free, and the median filter
+  on top removes what's left (hair strands, skin texture, fabric weave,
+  JPEG noise) WITHOUT softening real edges the way a Gaussian blur would
+  (a pixel next to a hard edge still takes its value from whichever side
+  of the edge most of its neighbourhood sits on). It's also considerably
+  faster on large pasted images, since the flood itself now runs on a much
+  smaller grid. Seed pixel coordinates are scaled into the downsampled
+  grid via seedsToLocalIndices()'s new `scale` parameter. The existing
+  noise-floor/cost-scale constants (EDGE_NOISE_FLOOR etc.) are left as a
+  light backstop rather than pushed further, since most of the actual
+  denoising work has moved to this pre-filtering stage.
+
+  v10 CHANGE
+  ---------------------------------------------------------------
+  Pushed spreading further again, now backed by the v9 pre-filtering
+  instead of fighting raw noise directly: EDGE_NOISE_FLOOR raised (10),
+  GEODESIC_FLOOR_COST lowered further (0.08), EDGE_COST_SCALE raised (3.0),
+  GEODESIC_PASSES raised to 6 (affordable now that the flood runs on the
+  downsampled working copy, not the full image), and MEDIAN_FILTER_RADIUS
+  bumped to 3 to back up the higher noise floor with a bit more actual
+  denoising. Same constants as always if this needs nudging further in
+  either direction.
+
+  v11 CHANGE
+  ---------------------------------------------------------------
+  Added a second classification signal alongside the geodesic one: direct
+  colour similarity, independent of spatial reachability. Until now the
+  entire classifier was geodesic — a pixel only counted as "close" to a
+  seed if there was a cheap path to it, so two patches of near-identical
+  colour that happened to be separated by an edge (a gap in hair, a second
+  patch of matching background on the far side of something) wouldn't both
+  get removed even though they looked the same. classifyRegion() now also
+  runs a small k-means (kmeansLab(), COLOR_KMEANS_K centroids) over the fg
+  and bg seed colours, and blends each pixel's plain colour-distance to
+  those centroids into the same diff used for the geodesic term, weighted
+  by COLOR_MATCH_WEIGHT. The geodesic term still does most of the work of
+  finding and respecting edges; the colour term's job is specifically to
+  catch straggling same-coloured bits the spatial flood alone can't reach.
+
+  v12 CHANGE
+  ---------------------------------------------------------------
+  Targeted the JPEG-screenshot case specifically, plus a real bug in the
+  island cleanup:
+  - boxBlurLab() now runs BEFORE medianFilterLab(), specifically to smooth
+    JPEG 8x8 DCT block seams — grid-aligned, usually-small colour jumps
+    that a median filter doesn't reliably absorb on its own — so they read
+    as noise (and get skipped by the edge-cost noise floor) instead of a
+    tiny fenced-off region of their own.
+  - Bug fix: island cleanup only ever ran at full resolution, AFTER
+    upsampling the classification result back up from the small working
+    grid. A single stray noisy pixel in that small grid becomes a multi-
+    pixel blob after bilinear upsampling (roughly (upsample factor)^2
+    pixels), which could comfortably clear the full-res cleanup threshold
+    and survive as a visible speck. removeSmallIslands() now also runs on
+    the small grid BEFORE upsampling (MIN_ISLAND_AREA_SMALL_PX), catching
+    noise at the scale it actually occurred at.
+  - Also lowered COST_DOWNSAMPLE_MAX_DIM (700 → 550) for more inherent
+    smoothing from the downsampling step itself.
+
+  v13 CHANGE — algorithm rewrite: geodesic flood → GrabCut min-cut
+  ---------------------------------------------------------------
+  v7-v12 kept tuning an edge-aware geodesic distance flood (see the v5-v12
+  notes above for that history) — a LOCAL, greedy algorithm: each pixel
+  grabs whichever path looked cheapest as a raster sweep passed over it,
+  and once decided, never reconsiders. That turned out to be a real
+  ceiling: it could spread through noisy/JPEG-compressed regions or get
+  stuck leaving disconnected same-coloured "islands" behind, no matter how
+  the noise-floor/cost-scale constants were tuned, because the algorithm
+  itself has no way to reconsider a local decision in light of the whole
+  region.
+  Replaced entirely with a real implementation of GrabCut (Rother/
+  Kolmogorov/Blake 2004) — the same graph min-cut algorithm PowerPoint's
+  own pre-AI "Remove Background" uses. See the BACKGROUND REMOVAL
+  ALGORITHM note above for the full description; in short: every pixel is
+  a graph node, a GLOBAL min-cut/max-flow solve (Dinic's algorithm,
+  implemented from scratch — buildGridTopology()/solveMaxFlow()/
+  extractSourceSide()) finds the cheapest way to split the whole graph at
+  once, and a lightweight Gaussian-mixture colour model (fitGmmLite()/
+  unaryCost()) drives each pixel's per-terminal cost, refit and re-cut for
+  GRABCUT_ITERATIONS passes. This fixes both of the geodesic approach's
+  structural weaknesses directly rather than tuning around them: colour
+  evidence alone (no spatial path needed) can now pull in a disconnected
+  same-coloured region, and small islands are intrinsically expensive in a
+  min-cut's cost structure (their boundary cost usually exceeds what
+  they'd save), so they mostly stop forming rather than needing cleanup.
+  All the pre/post-processing built up over v9-v12 — downsample, pre-blur,
+  median filter, small-grid island cleanup, upsample, full-res island
+  cleanup, asymmetric feather, hard binarize — is UNCHANGED and still runs
+  around the new classifier; only the classification step itself (what was
+  geodesicDistance() + the colour-blend diff formula) was replaced. Runs in
+  roughly 1-1.5s at the largest working-grid size with the default 2
+  iterations — noticeably slower than the geodesic flood's typical
+  sub-second time, but this was tested (see /home/claude/maxflow/ during
+  development) against a reference max-flow implementation on random graphs
+  for correctness, and against a synthetic disconnected-same-colour-patch
+  scenario to confirm it actually solves the reported problem before this
+  was shipped.
+
+  v14-v16 CHANGES
+  ---------------------------------------------------------------
+  v14: Sketch's recolour tint (Sepia/Duotone) is now applied to the
+  finished sketch result, not run upstream and discarded the moment the
+  effect converts to grayscale (see sketch()).
+  v15: Ctrl/Cmd+C copies the PNG to the clipboard from anywhere in the app.
+  Crop button becomes "Keep Crop" once a valid rect is drawn (Enter still
+  works too). Removed the Mosaic artistic effect. Sketch got a contrast
+  boost and a multiply-blended diagonal hatching texture (applyHatching())
+  for a more hand-drawn look. Also fixed applyCrop() leaving state.bbox as
+  null post-crop, which silently required redrawing the Area box before
+  Auto Keep/Remove worked again.
+  v16: classifyRegion() is now async and yields to the browser between
+  stages (uiTick(), double-rAF) so a busy overlay with staged progress text
+  and a bar can actually paint and update — a purely synchronous function,
+  however long-running, gives the browser no chance to render anything
+  until it returns, which is why large images used to look frozen rather
+  than "working". Below BUSY_OVERLAY_MIN_PIXELS this is skipped entirely
+  (classification is fast enough there that yielding would only add
+  latency). Input is blocked (setBusy(), body.busy CSS) while a classify is
+  in flight, since classifyRegion() writes to the shared mask canvas in
+  stages — a new stroke or Undo mid-classify could otherwise race with it.
+
+  v17 CHANGE — sketch effect rewrite: colour-dodge → XDoG + tone-mapped hatching
+  ---------------------------------------------------------------
+  Replaced the classic "grayscale + inverted-blur + colour-dodge" trick
+  (an approximation of edge detection that tends to read as a soft, washed-
+  out contour map) with two real techniques:
+  - Line layer: XDoG (eXtended Difference-of-Gaussians — Winnemöller et al.),
+    a proper edge-detection technique built specifically for stylized line
+    art. Two Gaussian blurs of the grayscale image at different radii
+    (native CSS blur(), genuinely Gaussian per spec) are subtracted; flat
+    colour always produces a safely-positive difference regardless of how
+    dark or light it is (verified numerically during development, see
+    /home/claude/maxflow/test_xdog_math.js), so only real edges — where the
+    two blurs diverge — cross the threshold into becoming a line. XDOG_TAU
+    controls how many/bold the lines are; XDOG_PHI controls how hard-edged
+    vs soft they look.
+  - Shading layer: applyToneHatching() replaces the old flat, uniform
+    multiply-blended hatching with tiered hatching driven by a heavily-
+    blurred regional tone reference (SKETCH_TONE_BLUR_MULT) — clean paper
+    above SKETCH_HATCH_LIGHT_THRESHOLD, single-direction hatching in
+    midtones, true cross-hatching (both diagonal directions) at/below
+    SKETCH_HATCH_DARK_THRESHOLD. This is the actual technique pencil
+    artists use to represent value, rather than one pattern applied
+    everywhere regardless of local tone.
+  Contrast boost, Sepia/Duotone re-tinting, and the intensity-controlled
+  opacity blend are all unchanged from v14/v15, just applied to the new
+  line+hatch result instead of the old colour-dodge one.
+
+  v18 CHANGES
+  ---------------------------------------------------------------
+  - Added a Paste button next to Open, for anyone who finds Ctrl/Cmd+V
+    fiddly. Uses navigator.clipboard.read() (pasteFromClipboardButton()) —
+    only usable because it's called directly from a click handler, which is
+    the user-gesture browsers require before letting a page read the
+    clipboard programmatically.
+  - Hatching redesign: v17's applyToneHatching() used a perfectly regular
+    mathematical lattice (every line the exact same length/angle/spacing),
+    which read as an obvious computer-generated grid rather than a hand-
+    drawn cross-hatch. Rewrote it to scatter short, jittered, overlapping
+    stroke segments across a coarse cell grid instead — randomised
+    position, angle (+/- SKETCH_HATCH_ANGLE_JITTER_DEG), and length per
+    stroke, via a deterministic coordinate hash (hashRandom()) rather than
+    Math.random(), so the pattern is stable across re-renders (nudging an
+    unrelated slider won't make the hatching visibly shift) while still
+    looking organic instead of tiled. All strokes are batched into a
+    single path and one stroke() call for performance — tested at full
+    2200x2200 scale beforehand (~63,000 strokes, ~30ms to build the path;
+    see /home/claude/maxflow/test_hatch_perf.js).
+
+  v19 CHANGE
+  ---------------------------------------------------------------
+  Fixed: marking an area with Auto Keep after it had previously been Auto
+  Removed (or vice versa) appeared to be ignored. Cause was NOT the area
+  being transparent — classifyRegion() always samples colour from the
+  original unmasked image regardless of current mask state, so that was
+  never the issue. The real cause: seeds accumulate for the whole session
+  and never expire, so the OLD hard "definitely background" seeds from the
+  first stroke were still sitting there as infinite-cost constraints,
+  actively outvoting the NEW "definitely foreground" seeds in every
+  classification afterward — the two marks were fighting, not the second
+  one losing to transparency. Fix: finalizeMarkStroke() now calls
+  removeSeedsNear() to drop any opposite-class seed within roughly the new
+  stroke's brush width before classifying, so a fresh mark actually
+  overrides an older conflicting one in the same spot instead of coexisting
+  with it forever.
+
+  v20 CHANGE
+  ---------------------------------------------------------------
+  Fixed two problems in sketch(), both traced to the same root cause: the
+  final blend drew the (fully opaque) sketch layer twice — once at
+  globalAlpha=intensity, then again underneath via destination-over at full
+  opacity, intended to "fill gaps" at low intensity. Since the layer was
+  opaque everywhere, that second draw exactly cancelled out whatever the
+  first draw's reduced alpha had left transparent, so the composited result
+  never actually depended on intensity at all — the slider was doing
+  nothing, not because of an off-by-one but because the maths made it a
+  no-op by construction.
+  Also, XDoG-only line art has nothing to say between edges — no lines
+  there, no hatching unless a tone tier kicks in — so all of the original
+  photo's continuous shading (skin, gentle shadows, gradients) was simply
+  gone, which read as "lost detail".
+  Fixed by rebuilding the layer order: sketch() now snapshots the current
+  image BEFORE touching ctx (`original`), builds a smooth continuous-tone
+  grayscale copy of it as the base (this is what restores the lost detail),
+  multiplies the XDoG line art onto that base (multiply against a mostly-
+  white line layer leaves non-edge areas exactly as smooth as the
+  grayscale photo — lines ADD structure instead of replacing all tone),
+  then hatches and re-tints as before. The final composite now draws
+  `original` first, then the finished sketch on top at globalAlpha=
+  intensity — a real blend between "photo as-is" and "full sketch" across
+  the whole slider range, not two draws of the same opaque layer cancelling
+  out. Also dialled SKETCH_CONTRAST down (1.6 → 1.3) since the base now
+  carries real continuous tone worth not flattening.
+
+  v21 CHANGE
+  ---------------------------------------------------------------
+  v20's plain-grayscale base fixed the detail loss but overcorrected: a
+  desaturated copy of the photo plus a thin multiplied line layer just
+  reads as "grayscale photo", not "sketch" — it has none of the tonal
+  character (broadly brightened midtones, natural glow/definition
+  gathering around edges) that actually makes something look hand-drawn.
+  Swapped the base back to the original v1 technique — colour-dodge a
+  blurred, inverted copy of the grayscale onto itself — which is what
+  supplies that character; XDoG stays multiplied on top of it for crisp,
+  well-defined edges the colour-dodge glow alone can miss on subtler
+  boundaries, and hatching/re-tint/the corrected intensity blend from v20
+  are unchanged. The colour-dodge glow's inner blur radius
+  (SKETCH_COLORDODGE_BLUR_PX) is now a fixed constant rather than tied to
+  intensity like the original v1 code did — intensity's only job now is
+  the final photo<->sketch blend, so internal effect parameters shifting
+  underneath it at the same time would just be confusing.
+-->
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snip &amp; Shift</title>
+<style>
+  :root{
+    --bg:            #1b1d22;
+    --panel:         #24272e;
+    --panel-raised:  #2c3039;
+    --line:          #383c46;
+    --ink:           #e9e8e4;
+    --ink-dim:       #9a9da6;
+    --accent:        #c98a3b;
+    --accent-dim:    #8f6229;
+    --keep:          #5fb87a;
+    --remove:        #e0688a;
+    --danger:        #e0688a;
+    --radius:        6px;
+    font-size: 15px;
+  }
+  *{ box-sizing: border-box; }
+  html,body{
+    margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow:hidden;
+  }
+  button{ font-family:inherit; }
+  .mono{ font-family: "SF Mono", "Consolas", "Courier New", monospace; }
+
+  #app{ display:flex; flex-direction:column; height:100%; }
+
+  /* ---------- Header ---------- */
+  header{
+    display:flex; align-items:center; gap:12px;
+    padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex:0 0 auto;
+  }
+  header .logo{ display:flex; align-items:center; gap:8px; margin-right:8px; }
+  header .logo svg{ width:22px; height:22px; }
+  header h1{
+    font-size:16px; font-weight:600; margin:0; letter-spacing:.02em;
+  }
+  header h1 span{ color:var(--accent); }
+  #statusHint{
+    color:var(--ink-dim); font-size:13px; margin-left:auto; text-align:right;
+    max-width:46%;
+  }
+
+  /* ---------- Toolbar ---------- */
+  #toolbar{
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+    padding:8px 16px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex:0 0 auto;
+    transition: opacity .15s ease;
+  }
+  body.busy #toolbar{ opacity:.5; pointer-events:none; }
+  body.busy #overlayCanvas{ pointer-events:none; }
+  .tbtn{
+    display:flex; flex-direction:column; align-items:center; gap:3px;
+    background:transparent; border:1px solid transparent; color:var(--ink-dim);
+    padding:6px 10px; border-radius:var(--radius); cursor:pointer; font-size:11px;
+    min-width:56px;
+  }
+  .tbtn svg{ width:18px; height:18px; }
+  .tbtn:hover{ background:var(--panel-raised); color:var(--ink); }
+  .tbtn.active{ background:var(--accent-dim); color:#fff; border-color:var(--accent); }
+  .tbtn:disabled{ opacity:.35; cursor:not-allowed; }
+  .tbtn:disabled:hover{ background:transparent; color:var(--ink-dim); }
+  .sep{ width:1px; align-self:stretch; background:var(--line); margin:2px 6px; }
+
+  #brushSizeWrap{ display:flex; align-items:center; gap:6px; color:var(--ink-dim); font-size:12px; }
+  #brushSizeWrap input[type=range]{ width:90px; }
+
+  .pillbtn{
+    background:var(--panel-raised); border:1px solid var(--line); color:var(--ink);
+    padding:7px 14px; border-radius:999px; cursor:pointer; font-size:13px;
+    display:flex; align-items:center; gap:6px;
+  }
+  .pillbtn:hover{ border-color:var(--accent); }
+  .pillbtn.primary{ background:var(--accent); border-color:var(--accent); color:#1b1d22; font-weight:600; }
+  .pillbtn.primary:hover{ filter:brightness(1.08); }
+  .pillbtn:disabled{ opacity:.4; cursor:not-allowed; }
+
+  /* ---------- Body layout ---------- */
+  #body{ flex:1 1 auto; display:flex; min-height:0; }
+
+  #canvasArea{
+    flex:1 1 auto; position:relative; display:flex; align-items:center; justify-content:center;
+    background:
+      linear-gradient(45deg,#26282e 25%,transparent 25%),
+      linear-gradient(-45deg,#26282e 25%,transparent 25%),
+      linear-gradient(45deg,transparent 75%,#26282e 75%),
+      linear-gradient(-45deg,transparent 75%,#26282e 75%);
+    background-size:22px 22px;
+    background-position:0 0,0 11px,11px -11px,-11px 0px;
+    background-color:#1f2127;
+    overflow:auto;
+    padding:24px;
+  }
+  #canvasStack{ position:relative; box-shadow:0 8px 30px rgba(0,0,0,.5); }
+  #displayCanvas, #overlayCanvas{ display:block; position:absolute; top:0; left:0; }
+  #overlayCanvas{ touch-action:none; cursor:crosshair; }
+
+  #busyOverlay{
+    position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background:rgba(20,21,25,.55); backdrop-filter:blur(1px);
+  }
+  #busyOverlay.show{ display:flex; }
+  #busyCard{
+    background:var(--panel-raised); border:1px solid var(--line); border-radius:10px;
+    padding:18px 22px; display:flex; flex-direction:column; align-items:center; gap:10px;
+    min-width:220px; box-shadow:0 10px 30px rgba(0,0,0,.4);
+  }
+  #busyCard .spinner{
+    width:22px; height:22px; border-radius:50%; border:3px solid var(--line);
+    border-top-color:var(--accent); animation:spin .7s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  #busyLabel{ font-size:13px; color:var(--ink); text-align:center; }
+  #busyBarTrack{
+    width:180px; height:5px; border-radius:3px; background:var(--line); overflow:hidden;
+  }
+  #busyBarFill{
+    height:100%; width:0%; background:var(--accent); border-radius:3px;
+    transition:width .18s ease;
+  }
+  #dropHint{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:10px; color:var(--ink-dim); text-align:center; pointer-events:none;
+  }
+  #dropHint strong{ color:var(--ink); font-size:18px; font-weight:600; }
+  #dropHint kbd{
+    background:var(--panel-raised); border:1px solid var(--line); padding:2px 7px;
+    border-radius:4px; font-family:inherit; font-size:13px;
+  }
+
+  /* ---------- Side panel ---------- */
+  #panel{
+    width:290px; flex:0 0 auto; background:var(--panel); border-left:1px solid var(--line);
+    overflow-y:auto; padding:16px;
+  }
+  .pgroup{ margin-bottom:22px; }
+  .pgroup h2{
+    font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-dim);
+    margin:0 0 10px 0; font-weight:600; display:flex; align-items:center; justify-content:space-between;
+  }
+  .pgroup h2 button{
+    background:none; border:none; color:var(--ink-dim); font-size:11px; cursor:pointer;
+    text-decoration:underline; text-underline-offset:2px; padding:0;
+  }
+  .pgroup h2 button:hover{ color:var(--accent); }
+  .row{ display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+  .row label{ flex:0 0 84px; font-size:12.5px; color:var(--ink-dim); }
+  .row input[type=range]{ flex:1 1 auto; }
+  .row .val{
+    flex:0 0 34px; text-align:right; font-size:12px; color:var(--ink-dim);
+  }
+  select{
+    width:100%; background:var(--panel-raised); color:var(--ink); border:1px solid var(--line);
+    border-radius:var(--radius); padding:6px 8px; font-size:13px;
+  }
+  .duotoneRow{ display:none; gap:8px; margin-top:8px; }
+  .duotoneRow.show{ display:flex; }
+  .duotoneRow input[type=color]{
+    flex:1; height:30px; border:1px solid var(--line); border-radius:var(--radius);
+    background:none; padding:0; cursor:pointer;
+  }
+  .artChoices{ display:flex; flex-direction:column; gap:6px; }
+  .artChoice{
+    display:flex; align-items:center; gap:8px; padding:7px 9px; border-radius:var(--radius);
+    border:1px solid var(--line); cursor:pointer; font-size:13px; color:var(--ink-dim);
+  }
+  .artChoice:hover{ border-color:var(--accent); }
+  .artChoice.active{ border-color:var(--accent); color:var(--ink); background:var(--panel-raised); }
+  .artParam{ display:none; margin-top:8px; }
+  .artParam.show{ display:block; }
+  input[type=range]{ accent-color:var(--accent); }
+  .exportBtns{ display:flex; flex-direction:column; gap:8px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="6" cy="6" r="3" stroke="#c98a3b" stroke-width="1.6"/>
+        <circle cx="6" cy="18" r="3" stroke="#c98a3b" stroke-width="1.6"/>
+        <path d="M8.5 8L20 19M20 5L8.5 16" stroke="#c98a3b" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h1>Snip <span>&amp;</span> Shift</h1>
+    <div id="statusHint">Paste an image to begin (Ctrl/Cmd+V)</div>
+  </header>
+
+  <div id="toolbar">
+    <button class="tbtn" id="btnOpen" title="Open image file">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M4 16l4-5 3 3 5-6 4 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/></svg>
+      Open
+    </button>
+    <button class="tbtn" id="btnPaste" title="Paste image from clipboard">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="6" y="3" width="12" height="4" rx="1" stroke="currentColor" stroke-width="1.6"/><path d="M6 5H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Paste
+    </button>
+    <input type="file" id="fileInput" accept="image/*" style="display:none">
+    <div class="sep"></div>
+
+    <button class="tbtn" id="toolCrop" data-tool="crop" title="Crop">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M6 2v16a1 1 0 0 0 1 1h16M2 6h16a1 1 0 0 1 1 1v16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Crop
+    </button>
+    <button class="tbtn" id="toolBbox" data-tool="bbox" title="Optional: narrow the working area before marking">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="5" width="16" height="14" rx="1" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2.5"/></svg>
+      Area
+    </button>
+    <button class="tbtn" id="toolKeep" data-tool="markKeep" title="Auto keep pen — line/click keeps similar-coloured areas">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#5fb87a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Auto Keep
+    </button>
+    <button class="tbtn" id="toolRemove" data-tool="markRemove" title="Auto remove pen — line/click removes similar-coloured areas">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="#e0688a" stroke-width="2" stroke-linecap="round"/></svg>
+      Auto Remove
+    </button>
+    <button class="tbtn" id="toolBrushAdd" data-tool="brushAdd" title="Keep pen — paints kept areas directly">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M4 20l1.5-5L16 4.5a2 2 0 0 1 3 3L8.5 18 4 20z" stroke="#5fb87a" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      Keep Pen
+    </button>
+    <button class="tbtn" id="toolBrushRemove" data-tool="brushRemove" title="Remove pen — paints removed areas directly">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M4 20l1.5-5L16 4.5a2 2 0 0 1 3 3L8.5 18 4 20z" stroke="#e0688a" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      Remove Pen
+    </button>
+
+    <div id="brushSizeWrap">
+      <span>Size</span>
+      <input type="range" id="brushSize" min="4" max="120" value="26">
+    </div>
+
+    <div class="sep"></div>
+    <label id="ghostToggleWrap" style="display:flex;align-items:center;gap:6px;color:var(--ink-dim);font-size:12px;cursor:pointer;">
+      <input type="checkbox" id="ghostToggle" checked>
+      Show removed areas
+    </label>
+
+    <div class="sep"></div>
+    <button class="tbtn" id="btnUndo" title="Undo (Ctrl+Z)">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M9 8L4 12l5 4M4 12h11a5 5 0 0 1 0 10h-1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Undo
+    </button>
+    <button class="tbtn" id="btnResetMask" title="Reset removal (keep everything)">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M4 4v6h6M20 20v-6h-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 15a8 8 0 0 0 14.5 3.5M19 9A8 8 0 0 0 4.5 5.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      Reset
+    </button>
+
+    <div style="flex:1"></div>
+    <button class="pillbtn" id="btnCopy" title="Copy PNG to clipboard">Copy PNG</button>
+    <button class="pillbtn primary" id="btnDownload" title="Download PNG">Download PNG</button>
+  </div>
+
+  <div id="body">
+    <div id="canvasArea">
+      <div id="dropHint">
+        <strong>Paste, drop, or open an image</strong>
+        <span>Clipboard paste works anywhere on this page &mdash; <kbd>Ctrl</kbd>+<kbd>V</kbd></span>
+      </div>
+      <div id="canvasStack">
+        <canvas id="displayCanvas"></canvas>
+        <canvas id="overlayCanvas"></canvas>
+        <div id="busyOverlay">
+          <div id="busyCard">
+            <span class="spinner"></span>
+            <div id="busyLabel">Working&hellip;</div>
+            <div id="busyBarTrack"><div id="busyBarFill"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel">
+
+      <div class="pgroup">
+        <h2>Corrections</h2>
+        <div class="row"><label>Brightness</label><input type="range" id="fxBrightness" min="-100" max="100" value="0"><span class="val mono" id="vBrightness">0</span></div>
+        <div class="row"><label>Contrast</label><input type="range" id="fxContrast" min="-100" max="100" value="0"><span class="val mono" id="vContrast">0</span></div>
+        <div class="row"><label>Sharpen</label><input type="range" id="fxSharpen" min="-100" max="100" value="0"><span class="val mono" id="vSharpen">0</span></div>
+      </div>
+
+      <div class="pgroup">
+        <h2>Colour</h2>
+        <div class="row"><label>Saturation</label><input type="range" id="fxSaturation" min="-100" max="100" value="0"><span class="val mono" id="vSaturation">0</span></div>
+        <div class="row"><label>Hue shift</label><input type="range" id="fxHue" min="-180" max="180" value="0"><span class="val mono" id="vHue">0</span></div>
+        <div class="row"><label>Temperature</label><input type="range" id="fxTemp" min="-100" max="100" value="0"><span class="val mono" id="vTemp">0</span></div>
+        <div class="row">
+          <label>Recolour</label>
+          <select id="fxRecolor">
+            <option value="none">None</option>
+            <option value="greyscale">Greyscale</option>
+            <option value="sepia">Sepia</option>
+            <option value="duotone">Duotone&hellip;</option>
+          </select>
+        </div>
+        <div class="duotoneRow" id="duotoneRow">
+          <input type="color" id="duotoneA" value="#1b1d22">
+          <input type="color" id="duotoneB" value="#c98a3b">
+        </div>
+      </div>
+
+      <div class="pgroup">
+        <h2>Artistic effect</h2>
+        <div class="artChoices" id="artChoices">
+          <label class="artChoice active" data-fx="none"><input type="radio" name="art" value="none" checked style="display:none"> None</label>
+          <label class="artChoice" data-fx="sketch"><input type="radio" name="art" value="sketch" style="display:none"> Pencil sketch</label>
+          <label class="artChoice" data-fx="posterize"><input type="radio" name="art" value="posterize" style="display:none"> Posterize</label>
+        </div>
+        <div class="artParam" id="paramSketch"><div class="row"><label>Intensity</label><input type="range" id="fxSketchIntensity" min="0" max="100" value="60"><span class="val mono" id="vSketchIntensity">60</span></div></div>
+        <div class="artParam" id="paramPosterize"><div class="row"><label>Levels</label><input type="range" id="fxPosterizeLevels" min="2" max="10" value="4"><span class="val mono" id="vPosterizeLevels">4</span></div></div>
+      </div>
+
+      <div class="pgroup">
+        <h2>Export <button id="btnResetAll">reset all</button></h2>
+        <div class="exportBtns">
+          <span style="font-size:12px;color:var(--ink-dim);">Copy or download whenever you like &mdash; nothing is destroyed by exporting.</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* =========================================================================
+   CONFIG — named tunables, all in one place
+   ========================================================================= */
+const CONFIG = {
+  MAX_UNDO_STEPS: 8,
+  MAX_CANVAS_DIM: 2200,          // pasted images larger than this are downscaled to keep filters fast
+  MAX_SEEDS_PER_CLASS: 600,      // cap on remembered keep/remove seed pixels per class
+  SEED_OVERRIDE_MARGIN_PX: 6,    // extra radius (beyond half the brush width) within which a new mark clears out older, opposite-class seeds it was drawn over
+  SAMPLE_STRIDE_PX: 3,           // min pixel distance between collected stroke sample points
+  GRABCUT_ITERATIONS: 2,         // colour-model refit + re-cut passes — iteration 0 fits from your seeds only, each further pass refits from the FULL current labelling (standard GrabCut-style refinement)
+  GMM_K: 5,                      // colour clusters per class in the lightweight GMM colour model
+  GMM_FIT_ITERS: 5,              // k-means iterations used to fit each GMM
+  GMM_VAR_FLOOR: 4,              // minimum per-cluster colour variance, so a near-uniform seed patch doesn't produce a degenerate near-zero-variance component
+  PAIRWISE_GAMMA: 20,            // overall scale of the neighbour-similarity (smoothness) edge weights in the min-cut graph
+  BG_DOMINANCE: 0.85,            // background "effort" is scaled down by this factor, so ambiguous/equidistant pixels lean toward removed rather than splitting evenly
+  TRANSPARENT_PULL_STRENGTH: 1.5,// how much more strongly a low-alpha (removed) neighbour pulls the feather average down than a high-alpha neighbour pulls it up
+  FEATHER_BLUR_PASSES: 1,        // asymmetric weighted-feather passes (see weightedFeather) applied BEFORE the final hard binarize — smooths the blocky edge upsampling leaves behind, doesn't leave any actual soft pixels behind
+  BORDER_SEED_BAND_PX: 10,       // how far outside the box we sample for automatic background seeds
+  INTERIOR_SEED_TARGET: 150,     // roughly how many automatic foreground seed points to take from the box interior
+  INTERIOR_SEED_INSET_FRAC: 0.22,// fraction of box size kept clear of the interior seed grid, to reduce seeds landing on background peeking in near the edges
+  MIN_ISLAND_AREA_PX: 30,        // connected regions smaller than this (in pixels) get merged into whichever class surrounds them — safety net; the min-cut itself rarely produces these, since a tiny island's cut perimeter usually costs more than its area saves
+  COST_DOWNSAMPLE_MAX_DIM: 550,  // the min-cut graph is built on a working copy no larger than this on its longest side — cheap noise averaging for free, and this is what keeps the max-flow solve fast on a large pasted image
+  PRE_BLUR_RADIUS: 1,            // mild box blur applied BEFORE the median filter, specifically to smooth JPEG 8x8 block seams so they don't register as real edges
+  MEDIAN_FILTER_RADIUS: 3,       // radius (in downsampled pixels) of the median filter run on the working copy before classifying — kills fine texture (hair strands, skin texture, fabric weave, JPEG noise) without softening real edges the way a blur would
+  MIN_ISLAND_AREA_SMALL_PX: 5,   // island cleanup run on the small working grid BEFORE upsampling — catches single-pixel noise at its actual scale, before upsampling inflates it past the full-resolution threshold above
+  GHOST_OPACITY: 0.3,            // on-screen-only opacity of removed areas (shown greyscale), so you can see what to restore
+  SKETCH_CONTRAST: 1.3,          // contrast boost applied on top of the colour-dodge+line base — kept moderate so it doesn't flatten the glow's tonal range
+  SKETCH_COLORDODGE_BLUR_PX: 5,  // blur radius for the colour-dodge glow's inverted layer — fixed rather than tied to intensity, since intensity now purely controls the final photo<->sketch blend
+  SKETCH_HATCH_SPACING_PX: 5,    // nominal gap between hatching strokes — also scales stroke length and cell size below
+  SKETCH_HATCH_CELL_MULT: 2.2,   // cell size = spacing * this — how far apart the randomised stroke clusters are seeded
+  SKETCH_HATCH_STROKES_PER_CELL: 2, // jittered strokes drawn per direction per cell
+  SKETCH_HATCH_ANGLE_JITTER_DEG: 12, // +/- random rotation applied to each stroke around its base 45°/-45° direction
+  SKETCH_HATCH_ALPHA: 0.28,      // how much each hatching hit darkens a pixel
+  SKETCH_HATCH_LIGHT_THRESHOLD: 195, // regional tone above this = clean paper, no hatching at all
+  SKETCH_HATCH_DARK_THRESHOLD: 110,  // regional tone at/below this = true cross-hatch (both directions); between the two thresholds = single-direction hatch only
+  SKETCH_TONE_BLUR_MULT: 12,     // the hatching tone reference is blurred this many times XDOG_SIGMA_BASE's radius — deliberately much coarser than the line detection, so hatching reflects broad regions of shading, not per-pixel noise
+  XDOG_SIGMA_BASE: 1.3,          // base Gaussian blur radius (px per 1000px of image) for XDoG line detection — larger = thicker/softer lines
+  XDOG_K: 1.6,                   // ratio between XDoG's two blur radii (standard XDoG default)
+  XDOG_TAU: 0.97,                // edge sensitivity — lower = more/bolder lines, higher = fewer/thinner lines
+  XDOG_EPSILON: 0,               // DoG threshold below which a pixel starts becoming a line (0 is always edge-safe here — see the maths note on computeXDoGAndTone)
+  XDOG_PHI: 10,                  // sharpness of the line edge — higher = harder/more graphic-novel, lower = softer/more pencil-like
+  BUSY_OVERLAY_MIN_PIXELS: 120000, // below this working-grid size (~350x350), classification is fast enough that showing/yielding for a progress UI would only add needless latency
+};
+
+/* =========================================================================
+   DOM refs
+   ========================================================================= */
+const $ = (id) => document.getElementById(id);
+const displayCanvas = $("displayCanvas");
+const overlayCanvas = $("overlayCanvas");
+const canvasStack = $("canvasStack");
+const dropHint = $("dropHint");
+const statusHint = $("statusHint");
+const busyOverlay = $("busyOverlay");
+const busyLabel = $("busyLabel");
+const busyBarFill = $("busyBarFill");
+const dctx = displayCanvas.getContext("2d");
+const octx = overlayCanvas.getContext("2d", { willReadFrequently: false });
+
+// Toggles the busy state: shows/hides the loading card, disables toolbar +
+// canvas interaction (classifyRegion() writes to the shared mask canvas
+// asynchronously in stages — letting the person start a new stroke or click
+// Undo mid-classify could race with that write and corrupt the mask).
+function setBusy(isBusy){
+  state.isClassifying = isBusy;
+  document.body.classList.toggle("busy", isBusy);
+  busyOverlay.classList.toggle("show", isBusy);
+}
+
+// Updates the loading card's text/progress, then yields to the browser so
+// it actually gets a chance to paint before the next (synchronous, and
+// potentially slow) chunk of work runs. A single requestAnimationFrame can
+// sometimes resolve just before a paint; double-rAF is the standard trick
+// to reliably wait until AFTER one has happened.
+function uiTick(message, percent){
+  busyLabel.textContent = message;
+  busyBarFill.style.width = clamp(percent,0,100) + "%";
+  return new Promise(resolve => requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+}
+
+// Offscreen working canvases
+const baseCanvas = document.createElement("canvas");
+const bctx = baseCanvas.getContext("2d", { willReadFrequently: true });
+const maskCanvas = document.createElement("canvas");
+const mctx = maskCanvas.getContext("2d", { willReadFrequently: true });
+
+/* =========================================================================
+   State
+   ========================================================================= */
+const state = {
+  hasImage: false,
+  w: 0, h: 0,
+  tool: "none",              // crop | bbox | markKeep | markRemove | brushAdd | brushRemove
+  brushSize: 26,
+  bbox: null,                // {x,y,w,h} in image space, or null
+  fgSeeds: [],                 // pixel coords [x,y] collected/seeded as "definitely keep"
+  bgSeeds: [],                 // pixel coords [x,y] collected/seeded as "definitely remove"
+  undoStack: [],              // maskCanvas ImageData snapshots
+  cropRect: null,             // pending crop rect while crop tool active
+  fx: {
+    brightness: 0, contrast: 0, sharpen: 0,
+    saturation: 0, hue: 0, temp: 0,
+    recolor: "none", duotoneA: "#1b1d22", duotoneB: "#c98a3b",
+    art: "none",
+    sketchIntensity: 60, posterizeLevels: 4,
+  },
+  pointer: { active:false, id:null, lastX:0, lastY:0, startX:0, startY:0 },
+  showGhost: true,
+  isClassifying: false,
+};
+
+/* =========================================================================
+   Utility: colour space + image helpers
+   ========================================================================= */
+function rgbToLab(r,g,b){
+  // sRGB -> linear
+  let rl=r/255, gl=g/255, bl=b/255;
+  rl = rl>0.04045 ? Math.pow((rl+0.055)/1.055,2.4) : rl/12.92;
+  gl = gl>0.04045 ? Math.pow((gl+0.055)/1.055,2.4) : gl/12.92;
+  bl = bl>0.04045 ? Math.pow((bl+0.055)/1.055,2.4) : bl/12.92;
+  // linear -> XYZ (D65)
+  let x = rl*0.4124 + gl*0.3576 + bl*0.1805;
+  let y = rl*0.2126 + gl*0.7152 + bl*0.0722;
+  let z = rl*0.0193 + gl*0.1192 + bl*0.9505;
+  x/=0.95047; z/=1.08883;
+  const f = (t)=> t>0.008856 ? Math.cbrt(t) : (7.787*t + 16/116);
+  const fx=f(x), fy=f(y), fz=f(z);
+  return [ (116*fy)-16, 500*(fx-fy), 200*(fy-fz) ]; // L,a,b
+}
+function clamp(v,lo,hi){ return v<lo?lo:(v>hi?hi:v); }
+
+function loadImageFromBlob(blob){
+  return new Promise((resolve,reject)=>{
+    const img = new Image();
+    img.onload = ()=>resolve(img);
+    img.onerror = reject;
+    img.src = URL.createObjectURL(blob);
+  });
+}
+
+function setImage(img){
+  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const maxDim = Math.max(w,h);
+  if (maxDim > CONFIG.MAX_CANVAS_DIM){
+    const scale = CONFIG.MAX_CANVAS_DIM / maxDim;
+    w = Math.round(w*scale); h = Math.round(h*scale);
+  }
+  state.hasImage = true;
+  state.w = w; state.h = h;
+  baseCanvas.width = w; baseCanvas.height = h;
+  bctx.clearRect(0,0,w,h);
+  bctx.drawImage(img,0,0,w,h);
+
+  maskCanvas.width = w; maskCanvas.height = h;
+  mctx.clearRect(0,0,w,h);
+  mctx.fillStyle = "#fff";
+  mctx.fillRect(0,0,w,h); // fully kept by default until a bbox/marking removes anything
+
+  displayCanvas.width = w; displayCanvas.height = h;
+  overlayCanvas.width = w; overlayCanvas.height = h;
+  canvasStack.style.width = w+"px";
+  canvasStack.style.height = h+"px";
+
+  state.bbox = { x:0, y:0, w, h };
+  state.undoStack = [];
+  seedInitialSamples(state.bbox);
+  resetFxOnly(false);
+  dropHint.style.display = "none";
+  setTool("markKeep");
+  updateStatus();
+  scheduleRender();
+}
+
+/* =========================================================================
+   Undo
+   ========================================================================= */
+function pushUndo(){
+  const snap = mctx.getImageData(0,0,state.w,state.h);
+  state.undoStack.push(snap);
+  if (state.undoStack.length > CONFIG.MAX_UNDO_STEPS) state.undoStack.shift();
+}
+function undo(){
+  if (!state.undoStack.length) return;
+  const snap = state.undoStack.pop();
+  mctx.putImageData(snap,0,0);
+  scheduleRender();
+}
+
+/* =========================================================================
+   Tool switching
+   ========================================================================= */
+function setTool(tool){
+  state.tool = tool;
+  document.querySelectorAll(".tbtn[data-tool]").forEach(b=>{
+    b.classList.toggle("active", b.dataset.tool === tool);
+  });
+  overlayCanvas.style.cursor = (tool==="brushAdd"||tool==="brushRemove") ? "none" : "crosshair";
+  updateStatus();
+  updateCropButtonLabel();
+}
+function hasValidCropRect(){
+  return state.tool==="crop" && !!state.cropRect && Math.abs(state.cropRect.w)>=4 && Math.abs(state.cropRect.h)>=4;
+}
+function updateCropButtonLabel(){
+  $("toolCrop").textContent = hasValidCropRect() ? "Keep Crop" : "Crop";
+}
+function updateStatus(){
+  if (!state.hasImage){ statusHint.textContent = "Paste an image to begin (Ctrl/Cmd+V)"; return; }
+  const msgs = {
+    none: "Choose a tool above.",
+    crop: "Drag to select a crop area, then press Keep Crop (or Enter) to apply.",
+    bbox: "Optional: drag a box to narrow the working area, then keep marking as usual.",
+    markKeep: "Auto keep pen — draw a line or click to intelligently keep similar areas.",
+    markRemove: "Auto remove pen — draw a line or click to intelligently remove similar areas.",
+    brushAdd: "Keep pen — paints kept areas directly, wherever you draw.",
+    brushRemove: "Remove pen — paints removed areas directly, wherever you draw.",
+  };
+  statusHint.textContent = msgs[state.tool] || "";
+}
+
+/* =========================================================================
+   Pointer input — unified Pointer Events for mouse / touch / pen
+   ========================================================================= */
+let strokeSamplePts = []; // image-space points collected during the current mark stroke, for sampling
+
+overlayCanvas.addEventListener("pointerdown", (e)=>{
+  if (!state.hasImage || state.isClassifying) return;
+  overlayCanvas.setPointerCapture(e.pointerId);
+  const p = toImageCoords(e);
+  state.pointer.active = true;
+  state.pointer.id = e.pointerId;
+  state.pointer.lastX = p.x; state.pointer.lastY = p.y;
+  state.pointer.startX = p.x; state.pointer.startY = p.y;
+  strokeSamplePts = [];
+
+  if (state.tool === "crop" || state.tool === "bbox"){
+    state.cropRect = { x:p.x, y:p.y, w:0, h:0 };
+    drawOverlay();
+  } else if (state.tool === "markKeep" || state.tool === "markRemove" || state.tool === "brushAdd" || state.tool === "brushRemove"){
+    applyBrushAt(p.x, p.y);
+    maybeSample(p.x, p.y);
+    drawOverlay(p.x,p.y);
+  }
+  e.preventDefault();
+}, {passive:false});
+
+overlayCanvas.addEventListener("pointermove", (e)=>{
+  const p = toImageCoords(e);
+  if (!state.pointer.active){
+    if (state.tool==="brushAdd"||state.tool==="brushRemove") drawOverlay(p.x,p.y);
+    return;
+  }
+  if (state.tool === "crop" || state.tool === "bbox"){
+    state.cropRect.w = p.x - state.cropRect.x;
+    state.cropRect.h = p.y - state.cropRect.y;
+    drawOverlay();
+  } else if (state.tool === "markKeep" || state.tool === "markRemove"){
+    strokeLine(state.pointer.lastX, state.pointer.lastY, p.x, p.y);
+    maybeSample(p.x,p.y);
+    drawOverlay(p.x,p.y);
+  } else if (state.tool === "brushAdd" || state.tool === "brushRemove"){
+    strokeLine(state.pointer.lastX, state.pointer.lastY, p.x, p.y);
+    drawOverlay(p.x,p.y);
+  }
+  state.pointer.lastX = p.x; state.pointer.lastY = p.y;
+  e.preventDefault();
+}, {passive:false});
+
+function endStroke(e){
+  if (!state.pointer.active) return;
+  state.pointer.active = false;
+  try{ overlayCanvas.releasePointerCapture(state.pointer.id); }catch(_){}
+
+  if (state.tool === "bbox"){
+    finalizeBbox();
+  } else if (state.tool === "crop"){
+    drawOverlay(); // keep crop rect visible until Enter/Escape
+  } else if (state.tool === "markKeep" || state.tool === "markRemove"){
+    finalizeMarkStroke();
+  } else if (state.tool === "brushAdd" || state.tool === "brushRemove"){
+    pushUndo_delayed();
+    scheduleRender();
+  }
+}
+overlayCanvas.addEventListener("pointerup", endStroke);
+overlayCanvas.addEventListener("pointercancel", endStroke);
+overlayCanvas.addEventListener("pointerleave", (e)=>{ if(!state.pointer.active) drawOverlay(); });
+
+function toImageCoords(e){
+  const r = overlayCanvas.getBoundingClientRect();
+  const scaleX = overlayCanvas.width / r.width;
+  const scaleY = overlayCanvas.height / r.height;
+  return {
+    x: clamp((e.clientX-r.left)*scaleX, 0, state.w),
+    y: clamp((e.clientY-r.top)*scaleY, 0, state.h),
+  };
+}
+
+function maybeSample(x,y){
+  const last = strokeSamplePts[strokeSamplePts.length-1];
+  if (last){
+    const dx=x-last[0], dy=y-last[1];
+    if (dx*dx+dy*dy < CONFIG.SAMPLE_STRIDE_PX*CONFIG.SAMPLE_STRIDE_PX) return;
+  }
+  strokeSamplePts.push([x,y]);
+}
+
+// Undo snapshots for brush strokes are pushed once per stroke, right before the
+// stroke's first edit, via brushUndoPendingGuard(); reset when the stroke ends.
+let brushStrokeStarted = false;
+function pushUndo_delayed(){ brushStrokeStarted = false; }
+function brushUndoPendingGuard(){
+  if (!brushStrokeStarted){ pushUndo(); brushStrokeStarted = true; }
+}
+
+// Single click/tap support for the add/remove paint brush (a dot, not a line)
+function applyBrushAt(x,y){
+  const tool = state.tool;
+  if (tool === "brushAdd" || tool === "brushRemove"){
+    brushUndoPendingGuard();
+    mctx.save();
+    mctx.fillStyle = "#fff";
+    mctx.globalCompositeOperation = (tool === "brushAdd") ? "source-over" : "destination-out";
+    mctx.beginPath(); mctx.arc(x,y,state.brushSize/2,0,Math.PI*2); mctx.fill();
+    mctx.restore();
+    scheduleRender();
+  }
+}
+
+function strokeLine(x0,y0,x1,y1){
+  const tool = state.tool;
+  if (tool === "brushAdd" || tool === "brushRemove"){
+    brushUndoPendingGuard();
+    mctx.save();
+    mctx.lineCap = "round"; mctx.lineJoin = "round";
+    mctx.lineWidth = state.brushSize;
+    mctx.strokeStyle = "#fff";
+    mctx.globalCompositeOperation = (tool === "brushAdd") ? "source-over" : "destination-out";
+    mctx.beginPath(); mctx.moveTo(x0,y0); mctx.lineTo(x1,y1); mctx.stroke();
+    mctx.restore();
+    scheduleRender();
+  }
+  // markKeep / markRemove strokes are visual-only on the overlay until finalized;
+  // actual mask edits happen in finalizeMarkStroke() below.
+}
+
+// Seeds both classes automatically the moment a bounding box is set, so the
+// very first Keep or Remove stroke a person draws already has both classes
+// available and feeds real geodesic classification (see finalizeMarkStroke)
+// instead of the direct-punch fallback. Background seeds come from a thin
+// ring of pixels just outside the box (always genuinely background), or the
+// four canvas corners if the box fills the whole image. Foreground seeds
+// come from a sparse grid across the box interior — an imperfect guess (the
+// box may be loose around the subject), but the same kind of rough initial
+// assumption PowerPoint's own auto-guess makes, and it gets corrected as
+// soon as real marks are drawn on top of it. Unlike v1-v4, these are stored
+// as pixel COORDINATES, not colours — classifyRegion() reads colours fresh
+// from the image when it builds the geodesic cost field.
+function seedInitialSamples(r){
+  state.fgSeeds = [];
+  state.bgSeeds = [];
+  const band = CONFIG.BORDER_SEED_BAND_PX;
+
+  const stepX = Math.max(6, Math.round(r.w/16));
+  const stepY = Math.max(6, Math.round(r.h/16));
+  for (let x=r.x; x<=r.x+r.w; x+=stepX){
+    pushSeedIfInBounds(state.bgSeeds, x, r.y-band/2);
+    pushSeedIfInBounds(state.bgSeeds, x, r.y+r.h+band/2);
+  }
+  for (let y=r.y; y<=r.y+r.h; y+=stepY){
+    pushSeedIfInBounds(state.bgSeeds, r.x-band/2, y);
+    pushSeedIfInBounds(state.bgSeeds, r.x+r.w+band/2, y);
+  }
+
+  const inset = Math.min(r.w, r.h) * CONFIG.INTERIOR_SEED_INSET_FRAC;
+  const innerW = Math.max(1, r.w-2*inset), innerH = Math.max(1, r.h-2*inset);
+  const stride = Math.max(10, Math.round(Math.sqrt((innerW*innerH)/CONFIG.INTERIOR_SEED_TARGET)));
+  for (let y=r.y+inset; y<=r.y+r.h-inset; y+=stride){
+    for (let x=r.x+inset; x<=r.x+r.w-inset; x+=stride){
+      pushSeedIfInBounds(state.fgSeeds, x, y);
+    }
+  }
+
+  // Box fills the whole image (no exterior band to sample) — fall back to
+  // the canvas corners as a rough background guess.
+  if (state.bgSeeds.length === 0){
+    for (const [x,y] of [[2,2],[state.w-3,2],[2,state.h-3],[state.w-3,state.h-3]]){
+      pushSeedIfInBounds(state.bgSeeds, x, y);
+    }
+  }
+  if (state.fgSeeds.length === 0){
+    pushSeedIfInBounds(state.fgSeeds, r.x+r.w/2, r.y+r.h/2);
+  }
+}
+function pushSeedIfInBounds(arr, x, y){
+  const xi = Math.round(x), yi = Math.round(y);
+  if (xi>=0 && yi>=0 && xi<state.w && yi<state.h) arr.push([xi,yi]);
+}
+
+// Returns a copy of `seeds` with any point within `radius` of any point in
+// `nearPts` removed — used so a fresh mark overrides older, conflicting
+// seeds in the same area instead of coexisting with them forever.
+function removeSeedsNear(seeds, nearPts, radius){
+  const r2 = radius*radius;
+  return seeds.filter(([sx,sy]) => {
+    for (const [px,py] of nearPts){
+      const dx=sx-px, dy=sy-py;
+      if (dx*dx+dy*dy <= r2) return false;
+    }
+    return true;
+  });
+}
+
+function finalizeBbox(){
+  brushStrokeStarted = false;
+  const r = normalizeRect(state.cropRect);
+  state.cropRect = null;
+  if (r.w < 6 || r.h < 6) { drawOverlay(); return; }
+  pushUndo();
+  state.bbox = r;
+  seedInitialSamples(r);
+  // Naive initial guess: everything inside the box is kept, outside is removed.
+  mctx.clearRect(0,0,state.w,state.h);
+  mctx.fillStyle = "#fff";
+  mctx.fillRect(r.x, r.y, r.w, r.h);
+  drawOverlay();
+  scheduleRender();
+  setTool("markKeep");
+}
+
+async function finalizeMarkStroke(){
+  brushStrokeStarted = false;
+  if (strokeSamplePts.length === 0) return;
+  const isKeep = state.tool === "markKeep";
+  const targetArr = isKeep ? state.fgSeeds : state.bgSeeds;
+  const pathPts = strokeSamplePts.slice();
+  for (const [x,y] of strokeSamplePts){
+    targetArr.push([Math.round(x), Math.round(y)]);
+    if (targetArr.length > CONFIG.MAX_SEEDS_PER_CLASS) targetArr.shift();
+  }
+  strokeSamplePts = [];
+
+  // A fresh mark should WIN over an older, conflicting one in the same
+  // spot — e.g. Auto Remove-ing an area, then later Auto Keep-ing part of
+  // it back. Without this, the original "definitely background" seeds from
+  // the first stroke never go away, and keep hard-outvoting the new
+  // "definitely foreground" seeds in every future classification, which
+  // looks like the tool is refusing to re-evaluate that area at all. Any
+  // opposite-class seed within roughly this stroke's brush width gets
+  // dropped, so the new mark actually overrides rather than just competing.
+  const overrideRadius = state.brushSize/2 + CONFIG.SEED_OVERRIDE_MARGIN_PX;
+  if (isKeep){
+    state.bgSeeds = removeSeedsNear(state.bgSeeds, pathPts, overrideRadius);
+  } else {
+    state.fgSeeds = removeSeedsNear(state.fgSeeds, pathPts, overrideRadius);
+  }
+
+  pushUndo();
+
+  if (state.fgSeeds.length > 0 && state.bgSeeds.length > 0){
+    await classifyRegion();
+  } else {
+    // Only one class exists so far — punch the stroke directly onto the mask
+    // as an immediate, responsive fallback until both classes are available.
+    const r = state.bbox || {x:0,y:0,w:state.w,h:state.h};
+    mctx.save();
+    mctx.beginPath(); mctx.rect(r.x,r.y,r.w,r.h); mctx.clip();
+    mctx.lineCap = "round"; mctx.lineJoin = "round";
+    mctx.lineWidth = state.brushSize;
+    mctx.strokeStyle = "#fff";
+    mctx.fillStyle = "#fff";
+    mctx.globalCompositeOperation = isKeep ? "source-over" : "destination-out";
+    mctx.beginPath();
+    if (pathPts.length === 1){
+      mctx.arc(pathPts[0][0], pathPts[0][1], state.brushSize/2, 0, Math.PI*2);
+      mctx.fill();
+    } else {
+      mctx.moveTo(pathPts[0][0], pathPts[0][1]);
+      for (let i=1;i<pathPts.length;i++) mctx.lineTo(pathPts[i][0], pathPts[i][1]);
+      mctx.stroke();
+    }
+    mctx.restore();
+  }
+  drawOverlay();
+  scheduleRender();
+}
+
+function normalizeRect(r){
+  const x = Math.min(r.x, r.x+r.w), y = Math.min(r.y, r.y+r.h);
+  return { x: Math.round(x), y: Math.round(y), w: Math.round(Math.abs(r.w)), h: Math.round(Math.abs(r.h)) };
+}
+
+/* =========================================================================
+   Geodesic classification (background removal core)
+   ========================================================================= */
+
+/* =========================================================================
+   Min-cut / max-flow graph engine (Dinic's algorithm)
+   ========================================================================= */
+
+// Builds the 4-connected grid graph's TOPOLOGY once (source + sink terminals,
+// one edge per pixel to each, plus right/down neighbour edges). Grid
+// connectivity is fully predictable, so degrees are computed in closed form
+// and CSR adjacency arrays are filled directly with typed-array cursors —
+// no array-of-arrays/push, which matters at ~300k+ nodes. Capacities are
+// left at 0 here; classifyRegion() rewrites them in place every refinement
+// iteration without needing to rebuild this structure.
+function buildGridTopology(gw, gh){
+  const n = gw*gh, SRC = n, SINK = n+1, numNodes = n+2;
+  const degree = new Int32Array(numNodes);
+  for (let p=0; p<n; p++){
+    const x = p%gw, y = (p/gw)|0;
+    degree[p] = 2 + (x<gw-1?1:0) + (x>0?1:0) + (y<gh-1?1:0) + (y>0?1:0);
+  }
+  degree[SRC] = n;
+  degree[SINK] = n;
+
+  const adjOffset = new Int32Array(numNodes+1);
+  for (let i=0;i<numNodes;i++) adjOffset[i+1] = adjOffset[i] + degree[i];
+  const adjList = new Int32Array(adjOffset[numNodes]);
+  const cursor = adjOffset.slice(0, numNodes);
+
+  const edgeTo = new Int32Array(adjOffset[numNodes]);
+  const edgeRev = new Int32Array(adjOffset[numNodes]);
+  const edgeCap = new Float64Array(adjOffset[numNodes]);
+  let edgeCount = 0;
+  function addEdge(u, v){
+    const e1 = edgeCount++;
+    edgeTo[e1] = v; edgeRev[e1] = e1+1;
+    adjList[cursor[u]++] = e1;
+    const e2 = edgeCount++;
+    edgeTo[e2] = u; edgeRev[e2] = e1;
+    adjList[cursor[v]++] = e2;
+    return e1;
+  }
+
+  const srcEdge = new Int32Array(n), sinkEdge = new Int32Array(n);
+  const rightEdge = new Int32Array(n).fill(-1), downEdge = new Int32Array(n).fill(-1);
+  for (let p=0; p<n; p++){
+    srcEdge[p] = addEdge(SRC, p);
+    sinkEdge[p] = addEdge(p, SINK);
+    const x = p%gw, y = (p/gw)|0;
+    if (x<gw-1) rightEdge[p] = addEdge(p, p+1);
+    if (y<gh-1) downEdge[p] = addEdge(p, p+gw);
+  }
+
+  return { numNodes, SRC, SINK, n, edgeTo, edgeRev, edgeCap, adjOffset, adjList, srcEdge, sinkEdge, rightEdge, downEdge };
+}
+
+// Dinic's max-flow algorithm: repeated BFS level-graph construction, then an
+// iterative (non-recursive — this graph is large enough that a recursive
+// DFS could blow the call stack) blocking-flow DFS per phase. Standard
+// "path stack" implementation: advance along admissible edges, and on a
+// dead end retreat one step AND advance that node's edge iterator, so the
+// same dead edge is never retried this phase.
+function solveMaxFlow(topo){
+  const { numNodes, SRC, SINK, edgeTo, edgeCap, edgeRev, adjOffset, adjList } = topo;
+  const level = new Int32Array(numNodes);
+  const it = new Int32Array(numNodes);
+  const queue = new Int32Array(numNodes);
+
+  function bfs(){
+    level.fill(-1);
+    let qh=0, qt=0;
+    level[SRC] = 0; queue[qt++] = SRC;
+    while (qh<qt){
+      const u = queue[qh++];
+      for (let ei=adjOffset[u]; ei<adjOffset[u+1]; ei++){
+        const e = adjList[ei], v = edgeTo[e];
+        if (edgeCap[e] > 1e-9 && level[v] < 0){ level[v] = level[u]+1; queue[qt++] = v; }
+      }
+    }
+    return level[SINK] >= 0;
+  }
+
+  function blockingFlow(){
+    let total = 0;
+    const path = [];
+    let u = SRC;
+    while (true){
+      if (u === SINK){
+        let bottleneck = Infinity;
+        for (const e of path) if (edgeCap[e] < bottleneck) bottleneck = edgeCap[e];
+        for (const e of path){ edgeCap[e] -= bottleneck; edgeCap[edgeRev[e]] += bottleneck; }
+        total += bottleneck;
+        let cut = path.length;
+        for (let k=0;k<path.length;k++){ if (edgeCap[path[k]] <= 1e-9){ cut=k; break; } }
+        path.length = cut;
+        u = cut===0 ? SRC : edgeTo[path[cut-1]];
+        continue;
+      }
+      let advanced = false;
+      while (it[u] < adjOffset[u+1]-adjOffset[u]){
+        const ei = adjOffset[u]+it[u], e = adjList[ei], v = edgeTo[e];
+        if (edgeCap[e] > 1e-9 && level[v] === level[u]+1){ path.push(e); u=v; advanced=true; break; }
+        it[u]++;
+      }
+      if (!advanced){
+        if (path.length === 0) return total;
+        path.pop();
+        u = path.length===0 ? SRC : edgeTo[path[path.length-1]];
+        it[u]++; // this edge led to a dead end — never try it again this phase
+      }
+    }
+  }
+
+  let flow = 0;
+  while (bfs()){ it.fill(0); flow += blockingFlow(); }
+  return flow;
+}
+
+// After solveMaxFlow(), every node reachable from SRC via edges with
+// remaining residual capacity is on the source (foreground) side of the
+// min-cut; everything else is background. This IS the segmentation —
+// natively binary, no threshold or feather needed to make it so.
+function extractSourceSide(topo){
+  const { numNodes, SRC, edgeTo, edgeCap, adjOffset, adjList } = topo;
+  const onSourceSide = new Uint8Array(numNodes);
+  const queue = new Int32Array(numNodes);
+  let qh=0, qt=0;
+  onSourceSide[SRC] = 1; queue[qt++] = SRC;
+  while (qh<qt){
+    const u = queue[qh++];
+    for (let ei=adjOffset[u]; ei<adjOffset[u+1]; ei++){
+      const e = adjList[ei], v = edgeTo[e];
+      if (edgeCap[e] > 1e-9 && !onSourceSide[v]){ onSourceSide[v]=1; queue[qt++]=v; }
+    }
+  }
+  return onSourceSide;
+}
+
+// Lightweight GMM: k-means clustering over Lab colour points, then per-
+// cluster mean/variance/mixture-weight computed directly from the final
+// assignment (a fast, standard approximation to full EM fitting — this is
+// close to what GrabCut itself does in practice: each pixel is assigned to
+// its single best-matching component, not blended across all of them).
+function fitGmmLite(points, k, iters, varFloor){
+  const n = points.length;
+  if (n === 0) return [];
+  k = Math.min(k, n);
+  const centroids = [];
+  for (let i=0;i<k;i++) centroids.push(points[Math.floor(i*n/k)].slice());
+  let assign = new Int32Array(n);
+  for (let iter=0; iter<iters; iter++){
+    for (let i=0;i<n;i++){
+      const p = points[i];
+      let best=0, bestD=Infinity;
+      for (let c=0;c<centroids.length;c++){
+        const cc=centroids[c];
+        const dl=p[0]-cc[0], da=p[1]-cc[1], db=p[2]-cc[2];
+        const d=dl*dl+da*da+db*db;
+        if (d<bestD){ bestD=d; best=c; }
+      }
+      assign[i]=best;
+    }
+    const sums = centroids.map(()=>[0,0,0,0]);
+    for (let i=0;i<n;i++){
+      const p=points[i], c=assign[i];
+      sums[c][0]+=p[0]; sums[c][1]+=p[1]; sums[c][2]+=p[2]; sums[c][3]++;
+    }
+    for (let c=0;c<centroids.length;c++){
+      if (sums[c][3]>0) centroids[c]=[sums[c][0]/sums[c][3], sums[c][1]/sums[c][3], sums[c][2]/sums[c][3]];
+    }
+  }
+  for (let i=0;i<n;i++){
+    const p = points[i];
+    let best=0, bestD=Infinity;
+    for (let c=0;c<centroids.length;c++){
+      const cc=centroids[c];
+      const dl=p[0]-cc[0], da=p[1]-cc[1], db=p[2]-cc[2];
+      const d=dl*dl+da*da+db*db;
+      if (d<bestD){ bestD=d; best=c; }
+    }
+    assign[i]=best;
+  }
+  const comps = centroids.map(()=>({sum:0,count:0}));
+  for (let i=0;i<n;i++){
+    const p=points[i], c=assign[i], cc=centroids[c];
+    const dl=p[0]-cc[0], da=p[1]-cc[1], db=p[2]-cc[2];
+    comps[c].sum += dl*dl+da*da+db*db;
+    comps[c].count++;
+  }
+  const gmm = [];
+  for (let c=0;c<centroids.length;c++){
+    if (comps[c].count===0) continue;
+    const variance = Math.max(varFloor, comps[c].sum/(comps[c].count*3));
+    gmm.push({ mean: centroids[c], variance, weight: comps[c].count/n });
+  }
+  return gmm;
+}
+
+// D(pixel, class) = min over components of the negative log-likelihood
+// (isotropic Gaussian): -log(weight) + 1.5*log(variance) + 0.5*distSq/variance.
+// Lower = better match to this class's colour model.
+function unaryCost(L, A, B, gmm){
+  let best = Infinity;
+  for (const g of gmm){
+    const dl=L-g.mean[0], da=A-g.mean[1], db=B-g.mean[2];
+    const distSq = dl*dl+da*da+db*db;
+    const cost = -Math.log(g.weight) + 1.5*Math.log(g.variance) + 0.5*distSq/g.variance;
+    if (cost < best) best = cost;
+  }
+  return best;
+}
+
+// Converts full-image pixel coordinates to flat indices within a gw*gh grid
+// anchored at (r.x, r.y) and scaled by `scale` (1 = full resolution, <1 for
+// the downsampled working copy classifyRegion() floods on). Drops any seed
+// that falls outside the grid.
+function seedsToLocalIndices(seeds, r, scale, gw, gh){
+  const out = [];
+  for (const [gx, gy] of seeds){
+    const lx = Math.round((gx - r.x) * scale);
+    const ly = Math.round((gy - r.y) * scale);
+    if (lx>=0 && ly>=0 && lx<gw && ly<gh) out.push(ly*gw + lx);
+  }
+  return out;
+}
+
+// In-place insertion sort of buf[0..n) — fast for the small windows a
+// median filter uses (typically 9-25 elements), no per-pixel allocation.
+function sortSmallWindow(buf, n){
+  for (let i=1;i<n;i++){
+    const v = buf[i];
+    let j = i-1;
+    while (j>=0 && buf[j]>v){ buf[j+1]=buf[j]; j--; }
+    buf[j+1]=v;
+  }
+}
+
+// Per-channel median filter over a [L,a,b, L,a,b, ...] array. Edge-preserving
+// by nature (unlike a Gaussian blur): a pixel right next to a hard edge still
+// takes its value from whichever side of the edge the majority of its
+// neighbourhood sits on, so real object boundaries stay crisp while fine
+// texture/noise within a region gets smoothed away.
+// Simple unweighted box blur over a [L,a,b, ...] array, run BEFORE the
+// median filter specifically to smooth JPEG block seams — an 8x8 DCT block
+// boundary is a real, if usually small, colour jump, and it's uniform and
+// grid-aligned enough that a median filter alone doesn't always fully
+// absorb it. A quick blur first softens those seams so they read as noise
+// (and get skipped by the geodesic edge-cost's noise floor) rather than a
+// tiny fenced-off region of their own.
+function boxBlurLab(labArr, w, h, radius){
+  if (radius <= 0) return labArr;
+  const out = new Float32Array(labArr.length);
+  for (let y=0; y<h; y++){
+    for (let x=0; x<w; x++){
+      let sL=0, sA=0, sB=0, n=0;
+      for (let dy=-radius; dy<=radius; dy++){
+        const yy=y+dy; if (yy<0||yy>=h) continue;
+        for (let dx=-radius; dx<=radius; dx++){
+          const xx=x+dx; if (xx<0||xx>=w) continue;
+          const idx=(yy*w+xx)*3;
+          sL+=labArr[idx]; sA+=labArr[idx+1]; sB+=labArr[idx+2]; n++;
+        }
+      }
+      const oi=(y*w+x)*3;
+      out[oi]=sL/n; out[oi+1]=sA/n; out[oi+2]=sB/n;
+    }
+  }
+  return out;
+}
+
+function medianFilterLab(labArr, w, h, radius){
+  const out = new Float32Array(labArr.length);
+  const winMax = (2*radius+1)*(2*radius+1);
+  const bufL = new Float32Array(winMax), bufA = new Float32Array(winMax), bufB = new Float32Array(winMax);
+  for (let y=0; y<h; y++){
+    for (let x=0; x<w; x++){
+      let n=0;
+      for (let dy=-radius; dy<=radius; dy++){
+        const yy=y+dy; if (yy<0||yy>=h) continue;
+        for (let dx=-radius; dx<=radius; dx++){
+          const xx=x+dx; if (xx<0||xx>=w) continue;
+          const idx=(yy*w+xx)*3;
+          bufL[n]=labArr[idx]; bufA[n]=labArr[idx+1]; bufB[n]=labArr[idx+2];
+          n++;
+        }
+      }
+      sortSmallWindow(bufL, n); sortSmallWindow(bufA, n); sortSmallWindow(bufB, n);
+      const mid = n>>1;
+      const oi=(y*w+x)*3;
+      out[oi]=bufL[mid]; out[oi+1]=bufA[mid]; out[oi+2]=bufB[mid];
+    }
+  }
+  return out;
+}
+
+// Bilinear-upsamples an alpha field from sw*sh to dw*dh. Used to bring the
+// downsampled classification result back to full resolution before the
+// existing island-cleanup/feather/binarize pipeline runs.
+function upsampleAlpha(src, sw, sh, dw, dh){
+  if (sw===dw && sh===dh) return src;
+  const out = new Uint8ClampedArray(dw*dh);
+  const sx = sw/dw, sy = sh/dh;
+  for (let y=0; y<dh; y++){
+    const fy = clamp((y+0.5)*sy - 0.5, 0, sh-1);
+    const y0 = Math.floor(fy), y1 = Math.min(y0+1, sh-1), wy = fy-y0;
+    for (let x=0; x<dw; x++){
+      const fx = clamp((x+0.5)*sx - 0.5, 0, sw-1);
+      const x0 = Math.floor(fx), x1 = Math.min(x0+1, sw-1), wx = fx-x0;
+      const v00=src[y0*sw+x0], v10=src[y0*sw+x1], v01=src[y1*sw+x0], v11=src[y1*sw+x1];
+      const top = v00*(1-wx) + v10*wx;
+      const bot = v01*(1-wx) + v11*wx;
+      out[y*dw+x] = Math.round(top*(1-wy) + bot*wy);
+    }
+  }
+  return out;
+}
+
+async function classifyRegion(){
+  const r = state.bbox;
+  if (!r) return;
+
+  const maxDim = Math.max(r.w, r.h);
+  const scale = Math.min(1, CONFIG.COST_DOWNSAMPLE_MAX_DIM / maxDim);
+  const gw = Math.max(1, Math.round(r.w*scale)), gh = Math.max(1, Math.round(r.h*scale));
+  const n = gw*gh;
+
+  const fgIdx = seedsToLocalIndices(state.fgSeeds, r, scale, gw, gh);
+  const bgIdx = seedsToLocalIndices(state.bgSeeds, r, scale, gw, gh);
+  if (!fgIdx.length || !bgIdx.length) return;
+
+  // Large regions can take a second or more of pure CPU-bound synchronous
+  // work — long enough to look like the tab has frozen. Below a size
+  // threshold it's fast enough that showing (and yielding for) a progress
+  // UI would only add needless latency, so skip it entirely in that case.
+  const showProgress = n > CONFIG.BUSY_OVERLAY_MIN_PIXELS;
+  if (showProgress) setBusy(true);
+  async function tick(msg, pct){ if (showProgress) await uiTick(msg, pct); }
+
+  try{
+    await tick("Preparing image\u2026", 4);
+
+    // Same preprocessing as before: downsample (cheap noise averaging, and
+    // much faster to segment), pre-blur (smooths JPEG block seams), median
+    // filter (kills remaining texture noise without softening real edges).
+    const dsCanvas = document.createElement("canvas");
+    dsCanvas.width = gw; dsCanvas.height = gh;
+    const dsCtx = dsCanvas.getContext("2d", { willReadFrequently: true });
+    dsCtx.imageSmoothingEnabled = true;
+    dsCtx.imageSmoothingQuality = "high";
+    dsCtx.drawImage(baseCanvas, r.x, r.y, r.w, r.h, 0, 0, gw, gh);
+    const data = dsCtx.getImageData(0, 0, gw, gh).data;
+
+    let labArr = new Float32Array(n*3);
+    for (let p=0, di=0; p<n; p++, di+=4){
+      const lab = rgbToLab(data[di], data[di+1], data[di+2]);
+      const o = p*3;
+      labArr[o]=lab[0]; labArr[o+1]=lab[1]; labArr[o+2]=lab[2];
+    }
+    labArr = boxBlurLab(labArr, gw, gh, CONFIG.PRE_BLUR_RADIUS);
+    if (CONFIG.MEDIAN_FILTER_RADIUS > 0){
+      labArr = medianFilterLab(labArr, gw, gh, CONFIG.MEDIAN_FILTER_RADIUS);
+    }
+
+    await tick("Building colour model\u2026", 12);
+
+    // ---- GrabCut-style min-cut classification ----
+    // This replaces the old geodesic-flood + colour-blend heuristic entirely.
+    // Every pixel is a graph node connected to its 4 neighbours (edge weight =
+    // how alike their colours are) and to two terminals, source/sink, with
+    // weights from how well the pixel matches a foreground/background colour
+    // model (a lightweight GMM fit from your marked seeds). A min-cut/max-flow
+    // solve then finds the GLOBALLY cheapest way to split the whole graph into
+    // two pieces — not a local greedy decision like the old flood, so a
+    // same-coloured patch elsewhere in the region gets folded in correctly
+    // even with no cheap spatial path to a seed, and small isolated islands
+    // are intrinsically expensive (their boundary/perimeter cost isn't worth
+    // paying to save a small area), so they mostly never form in the first
+    // place rather than needing to be cleaned up after the fact.
+    const topo = buildGridTopology(gw, gh);
+    const fgSeedSet = new Set(fgIdx), bgSeedSet = new Set(bgIdx);
+
+    // Adaptive edge-weight scale: beta is set from the average colour jump
+    // between neighbouring pixels in THIS region, so the same GAMMA constant
+    // behaves sensibly whether the image is low-contrast or high-contrast.
+    let sumSq=0, cnt=0;
+    for (let p=0; p<n; p++){
+      const x=p%gw, y=(p/gw)|0, i=p*3;
+      if (x<gw-1){ const j=(p+1)*3; const dl=labArr[i]-labArr[j],da=labArr[i+1]-labArr[j+1],db=labArr[i+2]-labArr[j+2]; sumSq+=dl*dl+da*da+db*db; cnt++; }
+      if (y<gh-1){ const j=(p+gw)*3; const dl=labArr[i]-labArr[j],da=labArr[i+1]-labArr[j+1],db=labArr[i+2]-labArr[j+2]; sumSq+=dl*dl+da*da+db*db; cnt++; }
+    }
+    const beta = 1/(2*Math.max(1e-6, sumSq/Math.max(1,cnt)));
+
+    let currentFg = fgIdx, currentBg = bgIdx, onSourceSide;
+    for (let iter=0; iter<CONFIG.GRABCUT_ITERATIONS; iter++){
+      const iterPct = 15 + (iter/CONFIG.GRABCUT_ITERATIONS)*70;
+      await tick(`Solving (pass ${iter+1} of ${CONFIG.GRABCUT_ITERATIONS})\u2026`, iterPct);
+
+      const fgColors = currentFg.map(i => [labArr[i*3], labArr[i*3+1], labArr[i*3+2]]);
+      const bgColors = currentBg.map(i => [labArr[i*3], labArr[i*3+1], labArr[i*3+2]]);
+      const fgGmm = fitGmmLite(fgColors, CONFIG.GMM_K, CONFIG.GMM_FIT_ITERS, CONFIG.GMM_VAR_FLOOR);
+      const bgGmm = fitGmmLite(bgColors, CONFIG.GMM_K, CONFIG.GMM_FIT_ITERS, CONFIG.GMM_VAR_FLOOR);
+
+      for (let p=0; p<n; p++){
+        const i = p*3, L=labArr[i], A=labArr[i+1], B=labArr[i+2];
+        // Background "effort" is scaled down, so a pixel that's a genuinely
+        // ambiguous match to both models leans toward removed rather than
+        // sitting exactly on the fence.
+        let capS = unaryCost(L,A,B,bgGmm) * CONFIG.BG_DOMINANCE; // cost of labelling this pixel background
+        let capT = unaryCost(L,A,B,fgGmm);                       // cost of labelling this pixel foreground
+        if (fgSeedSet.has(p)){ capS = 1e9; capT = 0; }
+        if (bgSeedSet.has(p)){ capS = 0; capT = 1e9; }
+        topo.edgeCap[topo.srcEdge[p]] = capS;
+        topo.edgeCap[topo.edgeRev[topo.srcEdge[p]]] = 0;
+        topo.edgeCap[topo.sinkEdge[p]] = capT;
+        topo.edgeCap[topo.edgeRev[topo.sinkEdge[p]]] = 0;
+        if (topo.rightEdge[p] >= 0){
+          const j=(p+1)*3;
+          const dl=L-labArr[j], da=A-labArr[j+1], db=B-labArr[j+2];
+          const w = CONFIG.PAIRWISE_GAMMA * Math.exp(-beta*(dl*dl+da*da+db*db));
+          topo.edgeCap[topo.rightEdge[p]] = w;
+          topo.edgeCap[topo.edgeRev[topo.rightEdge[p]]] = w;
+        }
+        if (topo.downEdge[p] >= 0){
+          const j=(p+gw)*3;
+          const dl=L-labArr[j], da=A-labArr[j+1], db=B-labArr[j+2];
+          const w = CONFIG.PAIRWISE_GAMMA * Math.exp(-beta*(dl*dl+da*da+db*db));
+          topo.edgeCap[topo.downEdge[p]] = w;
+          topo.edgeCap[topo.edgeRev[topo.downEdge[p]]] = w;
+        }
+      }
+
+      solveMaxFlow(topo);
+      onSourceSide = extractSourceSide(topo);
+
+      // Refit next iteration's colour models from the FULL current labelling
+      // (not just the original seeds) — standard GrabCut-style refinement.
+      // Hard seed pixels keep their user-assigned label regardless.
+      if (iter < CONFIG.GRABCUT_ITERATIONS-1){
+        currentFg = []; currentBg = [];
+        for (let p=0; p<n; p++) (onSourceSide[p] ? currentFg : currentBg).push(p);
+      }
+    }
+
+    await tick("Cleaning up edges\u2026", 90);
+
+    const smallAlpha = new Uint8ClampedArray(n);
+    for (let p=0; p<n; p++) smallAlpha[p] = onSourceSide[p] ? 255 : 0;
+
+    // Clean up noise-scale islands HERE, on the small working grid, before
+    // upsampling — a single stray pixel here is genuinely single-pixel noise,
+    // but after bilinear upsampling back to full resolution it can become a
+    // blob comfortably larger than the full-res cleanup threshold below, and
+    // survive. Catching it at its real scale first closes that gap. (The
+    // min-cut itself should rarely produce these — small islands cost more
+    // in cut perimeter than they save in unary cost — but this stays on as a
+    // safety net.)
+    const smallCleaned = removeSmallIslands(smallAlpha, gw, gh, CONFIG.MIN_ISLAND_AREA_SMALL_PX);
+
+    const alpha = upsampleAlpha(smallCleaned, gw, gh, r.w, r.h);
+    const cleaned = removeSmallIslands(alpha, r.w, r.h, CONFIG.MIN_ISLAND_AREA_PX);
+
+    // The feather pass only smooths the blocky edge that upsampling from a
+    // downsampled grid leaves behind — it is never the final output. Every
+    // pixel gets hard-snapped to fully kept or fully removed straight after,
+    // and a second island pass mops up anything that snapping happened to
+    // leave as a lone speck. This tool never leaves semi-transparent pixels
+    // behind.
+    let feathered = cleaned;
+    for (let pass=0; pass<CONFIG.FEATHER_BLUR_PASSES; pass++){
+      feathered = weightedFeather(feathered, r.w, r.h);
+    }
+    const binary = new Uint8ClampedArray(r.w*r.h);
+    for (let p=0; p<r.w*r.h; p++) binary[p] = feathered[p] >= 128 ? 255 : 0;
+    const finalAlpha = removeSmallIslands(binary, r.w, r.h, CONFIG.MIN_ISLAND_AREA_PX);
+
+    const maskImg = mctx.getImageData(0,0,state.w,state.h);
+    const mdata = maskImg.data;
+    for (let y=0;y<r.h;y++){
+      for (let x=0;x<r.w;x++){
+        const srcIdx = y*r.w+x;
+        const dstIdx = ((r.y+y)*state.w + (r.x+x))*4;
+        mdata[dstIdx]=255; mdata[dstIdx+1]=255; mdata[dstIdx+2]=255;
+        mdata[dstIdx+3]=finalAlpha[srcIdx];
+      }
+    }
+    // outside bbox always fully removed
+    mctx.putImageData(maskImg,0,0);
+    mctx.save();
+    mctx.globalCompositeOperation = "destination-in";
+    mctx.fillStyle="#fff";
+    mctx.beginPath(); mctx.rect(r.x,r.y,r.w,r.h); mctx.fill();
+    mctx.restore();
+  } finally {
+    if (showProgress) setBusy(false);
+  }
+}
+
+// Asymmetric feather: a low-alpha (removed) neighbour pulls the average down
+// harder than a high-alpha (kept) neighbour pulls it up. This is what makes
+// "definitely transparent" pixels carry more weight with their neighbours —
+// applied at the edge-softening stage, on top of the BG_DOMINANCE bias
+// already applied when building the min-cut's terminal costs above.
+function weightedFeather(src, w, h){
+  const out = new Uint8ClampedArray(src.length);
+  const boost = CONFIG.TRANSPARENT_PULL_STRENGTH;
+  for (let y=0;y<h;y++){
+    for (let x=0;x<w;x++){
+      let wsum=0, vsum=0;
+      for (let dy=-1; dy<=1; dy++){
+        const yy=y+dy; if (yy<0||yy>=h) continue;
+        for (let dx=-1; dx<=1; dx++){
+          const xx=x+dx; if (xx<0||xx>=w) continue;
+          const v = src[yy*w+xx];
+          const weight = 1 + boost*(255-v)/255;
+          wsum += weight; vsum += v*weight;
+        }
+      }
+      out[y*w+x] = vsum/wsum;
+    }
+  }
+  return out;
+}
+
+// Flood-fills the (thresholded) alpha into connected foreground/background
+// regions and merges any region smaller than `minArea` pixels into the
+// class that surrounds it. This is what cleans up the "grid dot" artefacts
+// that mis-placed automatic interior seeds can leave behind — a seed that
+// happened to land on a patch of background produces one tiny isolated
+// "kept" island, fully disconnected from the main subject, which this pass
+// simply erases. Real subject detail stays untouched because it's part of
+// one large connected mass, not a lone island.
+function removeSmallIslands(alpha, w, h, minArea){
+  const n = w*h;
+  const visited = new Uint8Array(n);
+  const out = alpha.slice();
+  const stack = new Int32Array(n);
+  const members = new Int32Array(n);
+
+  for (let start=0; start<n; start++){
+    if (visited[start]) continue;
+    const isFg = alpha[start] > 127;
+    let sp = 0, mp = 0;
+    stack[sp++] = start;
+    visited[start] = 1;
+    members[mp++] = start;
+    while (sp > 0){
+      const idx = stack[--sp];
+      const x = idx % w, y = (idx / w) | 0;
+      if (x>0){ const ni=idx-1; if(!visited[ni] && (alpha[ni]>127)===isFg){ visited[ni]=1; stack[sp++]=ni; members[mp++]=ni; } }
+      if (x<w-1){ const ni=idx+1; if(!visited[ni] && (alpha[ni]>127)===isFg){ visited[ni]=1; stack[sp++]=ni; members[mp++]=ni; } }
+      if (y>0){ const ni=idx-w; if(!visited[ni] && (alpha[ni]>127)===isFg){ visited[ni]=1; stack[sp++]=ni; members[mp++]=ni; } }
+      if (y<h-1){ const ni=idx+w; if(!visited[ni] && (alpha[ni]>127)===isFg){ visited[ni]=1; stack[sp++]=ni; members[mp++]=ni; } }
+    }
+    if (mp < minArea){
+      const fillVal = isFg ? 0 : 255; // flip the island to whichever class surrounds it
+      for (let k=0;k<mp;k++) out[members[k]] = fillVal;
+    }
+  }
+  return out;
+}
+
+/* =========================================================================
+   Overlay drawing (crosshair / bbox / marks preview)
+   ========================================================================= */
+function drawOverlay(brushX, brushY){
+  octx.clearRect(0,0,state.w,state.h);
+  updateCropButtonLabel();
+
+  if (state.bbox && state.tool !== "crop"){
+    octx.save();
+    octx.strokeStyle = "rgba(201,138,59,0.9)";
+    octx.setLineDash([6,4]);
+    octx.lineWidth = 2;
+    octx.strokeRect(state.bbox.x, state.bbox.y, state.bbox.w, state.bbox.h);
+    octx.restore();
+  }
+
+  if ((state.tool === "crop" || state.tool === "bbox") && state.cropRect){
+    const r = normalizeRect(state.cropRect);
+    octx.save();
+    octx.strokeStyle = state.tool==="crop" ? "#e9e8e4" : "#c98a3b";
+    octx.lineWidth = 2;
+    octx.setLineDash(state.tool==="crop" ? [] : [6,4]);
+    octx.strokeRect(r.x,r.y,r.w,r.h);
+    if (state.tool === "crop"){
+      octx.fillStyle = "rgba(0,0,0,0.45)";
+      octx.beginPath();
+      octx.rect(0,0,state.w,state.h);
+      octx.rect(r.x,r.y,r.w,r.h);
+      octx.fill("evenodd");
+    }
+    octx.restore();
+  }
+
+  if (state.tool === "markKeep" && strokeSamplePts.length){
+    drawStrokePreview(strokeSamplePts, "rgba(95,184,122,0.55)");
+  } else if (state.tool === "markRemove" && strokeSamplePts.length){
+    drawStrokePreview(strokeSamplePts, "rgba(224,104,138,0.55)");
+  }
+
+  if ((state.tool==="brushAdd"||state.tool==="brushRemove") && brushX!==undefined){
+    octx.save();
+    octx.strokeStyle = state.tool==="brushAdd" ? "#5fb87a" : "#e0688a";
+    octx.lineWidth = 1.5;
+    octx.beginPath();
+    octx.arc(brushX, brushY, state.brushSize/2, 0, Math.PI*2);
+    octx.stroke();
+    octx.restore();
+  }
+}
+function drawStrokePreview(pts, color){
+  octx.save();
+  octx.strokeStyle = color;
+  octx.lineWidth = state.brushSize;
+  octx.lineCap = "round"; octx.lineJoin = "round";
+  octx.beginPath();
+  octx.moveTo(pts[0][0], pts[0][1]);
+  for (let i=1;i<pts.length;i++) octx.lineTo(pts[i][0], pts[i][1]);
+  octx.stroke();
+  octx.restore();
+}
+
+/* =========================================================================
+   Crop apply / cancel
+   ========================================================================= */
+function applyCrop(){
+  if (!state.cropRect) return;
+  const r = normalizeRect(state.cropRect);
+  if (r.w<4 || r.h<4){ state.cropRect=null; drawOverlay(); return; }
+  const newBase = document.createElement("canvas");
+  newBase.width = r.w; newBase.height = r.h;
+  newBase.getContext("2d").drawImage(baseCanvas, r.x, r.y, r.w, r.h, 0,0, r.w, r.h);
+
+  const newMask = document.createElement("canvas");
+  newMask.width = r.w; newMask.height = r.h;
+  newMask.getContext("2d").drawImage(maskCanvas, r.x, r.y, r.w, r.h, 0,0, r.w, r.h);
+
+  state.w = r.w; state.h = r.h;
+  baseCanvas.width = r.w; baseCanvas.height = r.h;
+  bctx.drawImage(newBase,0,0);
+  maskCanvas.width = r.w; maskCanvas.height = r.h;
+  mctx.drawImage(newMask,0,0);
+
+  displayCanvas.width = r.w; displayCanvas.height = r.h;
+  overlayCanvas.width = r.w; overlayCanvas.height = r.h;
+  canvasStack.style.width = r.w+"px";
+  canvasStack.style.height = r.h+"px";
+
+  state.bbox = { x:0, y:0, w:r.w, h:r.h };
+  state.cropRect = null;
+  state.undoStack = [];
+  seedInitialSamples(state.bbox);
+  setTool("markKeep");
+  scheduleRender();
+}
+document.addEventListener("keydown", (e)=>{
+  if (!state.hasImage) return;
+  if (state.tool === "crop" && state.cropRect){
+    if (e.key === "Enter"){ applyCrop(); e.preventDefault(); }
+    if (e.key === "Escape"){ state.cropRect=null; drawOverlay(); e.preventDefault(); }
+  }
+  if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="z"){ undo(); e.preventDefault(); }
+  if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="c"){ copyPngToClipboard(); e.preventDefault(); }
+});
+
+/* =========================================================================
+   Composite / render pipeline
+   ========================================================================= */
+const workA = document.createElement("canvas");
+const wactx = workA.getContext("2d", { willReadFrequently:true });
+const maskedCanvas = document.createElement("canvas"); // clean, mask-applied result — this is what gets exported
+const mkctx = maskedCanvas.getContext("2d");
+
+function buildFilterString(fx){
+  const parts = [];
+  parts.push(`brightness(${1 + fx.brightness/100})`);
+  parts.push(`contrast(${1 + fx.contrast/100})`);
+  parts.push(`saturate(${clamp(1 + fx.saturation/100, 0, 3)})`);
+  if (fx.hue) parts.push(`hue-rotate(${fx.hue}deg)`);
+  if (fx.sharpen < 0){ parts.push(`blur(${(-fx.sharpen/100*4).toFixed(2)}px)`); }
+  return parts.join(" ");
+}
+
+function renderComposite(){
+  if (!state.hasImage) return;
+  const fx = state.fx;
+  const w = state.w, h = state.h;
+  workA.width = w; workA.height = h;
+  wactx.clearRect(0,0,w,h);
+  wactx.filter = buildFilterString(fx);
+  wactx.drawImage(baseCanvas, 0, 0);
+  wactx.filter = "none";
+
+  if (fx.temp !== 0){
+    applyTemperature(wactx, w, h, fx.temp);
+  }
+  if (fx.sharpen > 0){
+    applySharpen(wactx, w, h, fx.sharpen/100);
+  }
+  if (fx.recolor === "greyscale"){
+    applyCssFilterInPlace(wactx, w, h, "grayscale(1)");
+  } else if (fx.recolor === "sepia"){
+    applyCssFilterInPlace(wactx, w, h, "sepia(0.85)");
+  } else if (fx.recolor === "duotone"){
+    applyDuotone(wactx, w, h, fx.duotoneA, fx.duotoneB);
+  }
+
+  applyArtisticEffect(wactx, w, h, fx);
+  // workA now holds the fully effects-applied image, WITHOUT the mask —
+  // this is the "ghost" layer, kept around so removed areas can be shown
+  // faintly. Never exported directly.
+
+  maskedCanvas.width = w; maskedCanvas.height = h;
+  mkctx.clearRect(0,0,w,h);
+  mkctx.drawImage(workA, 0, 0);
+  mkctx.save();
+  mkctx.globalCompositeOperation = "destination-in";
+  mkctx.drawImage(maskCanvas, 0, 0);
+  mkctx.restore();
+  // maskedCanvas is now the clean, final cutout — this is what Copy/Download export.
+
+  dctx.clearRect(0,0,w,h);
+  if (state.showGhost){
+    dctx.save();
+    dctx.globalAlpha = CONFIG.GHOST_OPACITY;
+    dctx.filter = "grayscale(1)";
+    dctx.drawImage(workA, 0, 0);
+    dctx.restore();
+  }
+  dctx.drawImage(maskedCanvas, 0, 0);
+}
+
+function applyCssFilterInPlace(ctx, w, h, filterStr){
+  const tmp = document.createElement("canvas");
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext("2d");
+  tctx.filter = filterStr;
+  tctx.drawImage(ctx.canvas, 0, 0);
+  ctx.clearRect(0,0,w,h);
+  ctx.drawImage(tmp,0,0);
+}
+
+function applyTemperature(ctx, w, h, temp){
+  const img = ctx.getImageData(0,0,w,h);
+  const d = img.data;
+  const k = temp/100 * 40; // max +-40 per channel
+  for (let i=0;i<d.length;i+=4){
+    d[i]   = clamp(d[i]+k, 0, 255);
+    d[i+2] = clamp(d[i+2]-k, 0, 255);
+  }
+  ctx.putImageData(img,0,0);
+}
+
+function applySharpen(ctx, w, h, amount){
+  const src = ctx.getImageData(0,0,w,h);
+  const s = src.data;
+  const out = new Uint8ClampedArray(s.length);
+  const kernel = [0,-1,0, -1,5,-1, 0,-1,0];
+  for (let y=0;y<h;y++){
+    for (let x=0;x<w;x++){
+      const i = (y*w+x)*4;
+      if (x===0||y===0||x===w-1||y===h-1){
+        out[i]=s[i]; out[i+1]=s[i+1]; out[i+2]=s[i+2]; out[i+3]=s[i+3];
+        continue;
+      }
+      for (let c=0;c<3;c++){
+        let sum=0, k=0;
+        for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++,k++){
+          sum += s[((y+dy)*w+(x+dx))*4+c]*kernel[k];
+        }
+        out[i+c] = clamp(s[i+c]*(1-amount) + sum*amount, 0, 255);
+      }
+      out[i+3]=s[i+3];
+    }
+  }
+  ctx.putImageData(new ImageData(out,w,h),0,0);
+}
+
+function applyDuotone(ctx, w, h, hexA, hexB){
+  const a = hexToRgb(hexA), b = hexToRgb(hexB);
+  const img = ctx.getImageData(0,0,w,h);
+  const d = img.data;
+  for (let i=0;i<d.length;i+=4){
+    const lum = (0.299*d[i]+0.587*d[i+1]+0.114*d[i+2])/255;
+    d[i]   = a[0] + (b[0]-a[0])*lum;
+    d[i+1] = a[1] + (b[1]-a[1])*lum;
+    d[i+2] = a[2] + (b[2]-a[2])*lum;
+  }
+  ctx.putImageData(img,0,0);
+}
+function hexToRgb(hex){
+  const v = parseInt(hex.slice(1),16);
+  return [(v>>16)&255, (v>>8)&255, v&255];
+}
+
+function applyArtisticEffect(ctx, w, h, fx){
+  if (fx.art === "none") return;
+  if (fx.art === "posterize"){
+    posterize(ctx, w, h, fx.posterizeLevels);
+  } else if (fx.art === "sketch"){
+    sketch(ctx, w, h, fx.sketchIntensity/100, fx);
+  }
+}
+
+function posterize(ctx, w, h, levels){
+  const img = ctx.getImageData(0,0,w,h);
+  const d = img.data;
+  const step = 255/(levels-1);
+  for (let i=0;i<d.length;i+=4){
+    d[i]   = Math.round(Math.round(d[i]/step)*step);
+    d[i+1] = Math.round(Math.round(d[i+1]/step)*step);
+    d[i+2] = Math.round(Math.round(d[i+2]/step)*step);
+  }
+  ctx.putImageData(img,0,0);
+}
+
+function sketch(ctx, w, h, intensity, fx){
+  // Snapshot the current (corrections/colour already applied) image before
+  // touching ctx — this is both what XDoG reads from AND what `intensity`
+  // blends back toward at the end.
+  const original = document.createElement("canvas");
+  original.width = w; original.height = h;
+  original.getContext("2d").drawImage(ctx.canvas, 0, 0);
+
+  // XDoG (eXtended Difference-of-Gaussians): a proper edge-detection
+  // technique built for stylized line art. Two Gaussian blurs of the
+  // grayscale image at different radii are subtracted; in flat colour the
+  // two blurs agree and the difference stays harmless (see the maths note
+  // in computeXDoGAndTone()), but right at a real edge they diverge,
+  // producing a genuine line rather than a soft glow.
+  const maxDim = Math.max(w,h);
+  const sigma = clamp(CONFIG.XDOG_SIGMA_BASE * (maxDim/1000), 0.6, 6);
+  const { lines, tone } = computeXDoGAndTone(ctx, w, h, sigma);
+
+  const tmp = document.createElement("canvas");
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext("2d");
+
+  // Grayscale base.
+  tctx.filter = "grayscale(1)";
+  tctx.drawImage(original, 0, 0);
+  tctx.filter = "none";
+
+  // Classic colour-dodge pencil glow (the original v1 technique): invert
+  // and blur that SAME grayscale, then colour-dodge-blend it back onto the
+  // grayscale base. This is what actually gives a sketch its "drawn on
+  // paper" tonal character — broadly brightened midtones with a natural
+  // soft glow/definition gathering around edges — which a plain desaturated
+  // copy doesn't have; it just looks like a grayscale photo.
+  const inv = document.createElement("canvas");
+  inv.width = w; inv.height = h;
+  const ictx = inv.getContext("2d");
+  ictx.filter = `grayscale(1) invert(1) blur(${CONFIG.SKETCH_COLORDODGE_BLUR_PX}px)`;
+  ictx.drawImage(original, 0, 0);
+  ictx.filter = "none";
+  tctx.save();
+  tctx.globalCompositeOperation = "color-dodge";
+  tctx.drawImage(inv, 0, 0);
+  tctx.restore();
+
+  // Multiply the XDoG line art on top for crisp, well-defined edges the
+  // colour-dodge glow alone can miss on subtler boundaries.
+  const lineCanvas = document.createElement("canvas");
+  lineCanvas.width = w; lineCanvas.height = h;
+  const lctx = lineCanvas.getContext("2d");
+  const lineImg = lctx.createImageData(w,h);
+  for (let p=0, di=0; p<w*h; p++, di+=4){
+    const v = lines[p];
+    lineImg.data[di]=v; lineImg.data[di+1]=v; lineImg.data[di+2]=v; lineImg.data[di+3]=255;
+  }
+  lctx.putImageData(lineImg,0,0);
+  tctx.save();
+  tctx.globalCompositeOperation = "multiply";
+  tctx.drawImage(lineCanvas, 0, 0);
+  tctx.restore();
+
+  // Contrast push deepens the lines a little without flattening the
+  // continuous tone now underneath them into a hard-edged wash.
+  applyCssFilterInPlace(tctx, w, h, `contrast(${CONFIG.SKETCH_CONTRAST}) brightness(1.05)`);
+
+  // Tone-mapped cross-hatching: clean paper in light areas, single-
+  // direction hatching in midtones, true cross-hatching in shadows — the
+  // way pencil artists actually represent value/shading, driven by a
+  // heavily-smoothed regional tone reference (not the line art itself),
+  // so shading reflects the subject's broad value structure rather than
+  // just outline density.
+  applyToneHatching(tctx, w, h, tone);
+
+  // Sketch necessarily starts from a grayscale base, which would otherwise
+  // silently discard any Sepia/Duotone recolour chosen upstream. Re-apply
+  // that tint HERE, to the finished sketch, so recolour still shows up
+  // instead of quietly vanishing whenever Sketch is also on.
+  if (fx && fx.recolor === "sepia"){
+    applyCssFilterInPlace(tctx, w, h, "sepia(0.85)");
+  } else if (fx && fx.recolor === "duotone"){
+    applyDuotone(tctx, w, h, fx.duotoneA, fx.duotoneB);
+  }
+
+  // Intensity blends between the ORIGINAL (colour-corrected) image and the
+  // finished sketch — 0 leaves the photo as-is, 100 is the full sketch,
+  // and everything between is a genuine visible mix. (The old version drew
+  // the sketch layer twice — once at globalAlpha=intensity, then again
+  // underneath at full opacity to "fill gaps" — but since that layer was
+  // fully opaque everywhere, the second draw exactly cancelled out
+  // whatever the first draw's reduced alpha left transparent, so the
+  // result never actually depended on intensity at all.)
+  ctx.clearRect(0,0,w,h);
+  ctx.drawImage(original, 0, 0);
+  ctx.globalAlpha = intensity;
+  ctx.drawImage(tmp, 0, 0);
+  ctx.globalAlpha = 1;
+}
+
+// Builds a grayscale copy of ctx, blurs it at two radii (sigma and
+// sigma*XDOG_K) via the browser's native (genuinely Gaussian per spec)
+// CSS blur filter, and returns:
+//   lines — the XDoG line-art layer (255 = clean paper, lower = line)
+//   tone  — a much more heavily blurred grayscale, used as a smooth
+//           regional darkness reference for applyToneHatching()
+//
+// XDoG maths: D(x) = G_sigma(x) - tau*G_(sigma*k)(x), on grayscale values
+// normalised to [0,1]. In flat colour, G_sigma ≈ G_(sigma*k), so
+// D ≈ (1-tau)*G(x) — since tau<1 and G>=0, this is ALWAYS >= 0, meaning a
+// flat region can never misfire as a line regardless of how dark or light
+// it is (verified numerically before this was implemented — see
+// /home/claude/maxflow/test_xdog_math.js from development). Only where the
+// two blurs genuinely diverge (a real edge) does D dip below the epsilon
+// threshold, at which point a soft tanh curve (sharpness = XDOG_PHI) turns
+// that into a line rather than a hard binary cut.
+function computeXDoGAndTone(ctx, w, h, sigma){
+  const gray = document.createElement("canvas");
+  gray.width = w; gray.height = h;
+  const gctx = gray.getContext("2d");
+  gctx.filter = "grayscale(1)";
+  gctx.drawImage(ctx.canvas, 0, 0);
+  gctx.filter = "none";
+
+  const b1 = blurredGrayValues(gray, w, h, sigma);
+  const b2 = blurredGrayValues(gray, w, h, sigma*CONFIG.XDOG_K);
+  const tone = blurredGrayValues(gray, w, h, sigma*CONFIG.SKETCH_TONE_BLUR_MULT);
+
+  const n = w*h;
+  const lines = new Uint8ClampedArray(n);
+  const tau=CONFIG.XDOG_TAU, phi=CONFIG.XDOG_PHI, epsilon=CONFIG.XDOG_EPSILON;
+  for (let p=0; p<n; p++){
+    const g1=b1[p]/255, g2=b2[p]/255;
+    const dog = g1 - tau*g2;
+    const t = dog>=epsilon ? 1 : clamp(1+Math.tanh(phi*(dog-epsilon)), 0, 1);
+    lines[p] = Math.round(t*255);
+  }
+  return { lines, tone };
+}
+
+function blurredGrayValues(grayCanvas, w, h, radiusPx){
+  const tmp = document.createElement("canvas");
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext("2d");
+  tctx.filter = `blur(${radiusPx.toFixed(2)}px)`;
+  tctx.drawImage(grayCanvas, 0, 0);
+  tctx.filter = "none";
+  const data = tctx.getImageData(0,0,w,h).data;
+  const out = new Uint8ClampedArray(w*h);
+  for (let p=0, di=0; p<w*h; p++, di+=4) out[p] = data[di]; // R=G=B after grayscale
+  return out;
+}
+
+// A perfectly regular mathematical lattice (every line the same length,
+// angle, and spacing) is exactly what makes hatching read as "computer
+// pattern" instead of "hand-drawn" — real cross-hatching is made of many
+// short, overlapping, slightly-off strokes, not one continuous perfect
+// diagonal. This scatters short jittered stroke segments across a coarse
+// grid of "cells" instead: each cell's strokes get a randomised position,
+// angle, and length, using a deterministic hash of the cell coordinates
+// (hashRandom()) rather than Math.random() — so the pattern is stable
+// across re-renders (adjusting an unrelated slider won't make the hatching
+// visibly "swim"), but still looks organic rather than tiled. Tiered by
+// the local regional tone: clean above SKETCH_HATCH_LIGHT_THRESHOLD, one
+// hatching direction between the two thresholds, both directions (a true
+// cross-hatch) at/below SKETCH_HATCH_DARK_THRESHOLD.
+function hashRandom(x, y, salt){
+  let h = (x*374761393 + y*668265263 + salt*2246822519) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  h = Math.imul(h, 1274126177) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0;
+  return (h >>> 0) / 4294967296;
+}
+function applyToneHatching(ctx, w, h, toneArr){
+  const spacing = CONFIG.SKETCH_HATCH_SPACING_PX;
+  const lightT = CONFIG.SKETCH_HATCH_LIGHT_THRESHOLD;
+  const darkT = CONFIG.SKETCH_HATCH_DARK_THRESHOLD;
+  const cellSize = spacing * CONFIG.SKETCH_HATCH_CELL_MULT;
+  const cols = Math.ceil(w/cellSize)+1, rows = Math.ceil(h/cellSize)+1;
+  const angleJitterRad = CONFIG.SKETCH_HATCH_ANGLE_JITTER_DEG * Math.PI/180;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.strokeStyle = `rgba(0,0,0,${CONFIG.SKETCH_HATCH_ALPHA})`;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+
+  for (let cy=0; cy<rows; cy++){
+    for (let cx=0; cx<cols; cx++){
+      const baseX = cx*cellSize, baseY = cy*cellSize;
+      const sx = clamp(Math.round(baseX),0,w-1), sy = clamp(Math.round(baseY),0,h-1);
+      const tone = toneArr[sy*w+sx];
+      if (tone > lightT) continue;
+      const directions = tone <= darkT ? [Math.PI/4, -Math.PI/4] : [Math.PI/4];
+      for (let di=0; di<directions.length; di++){
+        const baseAngle = directions[di];
+        for (let s=0; s<CONFIG.SKETCH_HATCH_STROKES_PER_CELL; s++){
+          const salt = di*101 + s*17;
+          const jx = (hashRandom(cx,cy,salt+1)-0.5) * cellSize * 0.9;
+          const jy = (hashRandom(cx,cy,salt+2)-0.5) * cellSize * 0.9;
+          const angle = baseAngle + (hashRandom(cx,cy,salt+3)-0.5) * angleJitterRad * 2;
+          const length = spacing * (1.6 + hashRandom(cx,cy,salt+4)*1.8);
+          const px = baseX+jx, py = baseY+jy;
+          const dx = Math.cos(angle)*length/2, dy = Math.sin(angle)*length/2;
+          ctx.moveTo(px-dx, py-dy);
+          ctx.lineTo(px+dx, py+dy);
+        }
+      }
+    }
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* =========================================================================
+   Render scheduling — simple rAF coalescing. All effects here (native CSS
+   filters, XDoG sketch, posterize) are cheap enough to run
+   at full resolution on every input event, so no preview/debounce split
+   is needed.
+   ========================================================================= */
+let rafPending = false;
+function scheduleRender(){
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(()=>{
+    rafPending = false;
+    renderComposite();
+  });
+}
+
+/* =========================================================================
+   Effects panel wiring
+   ========================================================================= */
+function bindSlider(id, valId, fxKey, onInput){
+  const el = $(id), val = $(valId);
+  const update = ()=>{
+    const v = Number(el.value);
+    state.fx[fxKey] = v;
+    val.textContent = v;
+    if (onInput) onInput(v);
+    scheduleRender();
+  };
+  el.addEventListener("input", update);
+  return update;
+}
+bindSlider("fxBrightness","vBrightness","brightness");
+bindSlider("fxContrast","vContrast","contrast");
+bindSlider("fxSharpen","vSharpen","sharpen");
+bindSlider("fxSaturation","vSaturation","saturation");
+bindSlider("fxHue","vHue","hue");
+bindSlider("fxTemp","vTemp","temp");
+bindSlider("fxSketchIntensity","vSketchIntensity","sketchIntensity");
+bindSlider("fxPosterizeLevels","vPosterizeLevels","posterizeLevels");
+
+$("fxRecolor").addEventListener("change", (e)=>{
+  state.fx.recolor = e.target.value;
+  $("duotoneRow").classList.toggle("show", e.target.value === "duotone");
+  scheduleRender();
+});
+$("duotoneA").addEventListener("input", (e)=>{ state.fx.duotoneA = e.target.value; scheduleRender(); });
+$("duotoneB").addEventListener("input", (e)=>{ state.fx.duotoneB = e.target.value; scheduleRender(); });
+
+document.querySelectorAll(".artChoice").forEach(el=>{
+  el.addEventListener("click", ()=>{
+    document.querySelectorAll(".artChoice").forEach(o=>o.classList.remove("active"));
+    el.classList.add("active");
+    const fx = el.dataset.fx;
+    state.fx.art = fx;
+    ["Sketch","Posterize"].forEach(name=>{
+      $("param"+name).classList.toggle("show", fx === name.toLowerCase());
+    });
+    scheduleRender();
+  });
+});
+
+$("btnResetAll").addEventListener("click", ()=>resetFxOnly(true));
+function resetFxOnly(rerender){
+  state.fx = { brightness:0, contrast:0, sharpen:0, saturation:0, hue:0, temp:0,
+    recolor:"none", duotoneA:"#1b1d22", duotoneB:"#c98a3b", art:"none",
+    sketchIntensity:60, posterizeLevels:4 };
+  ["Brightness","Contrast","Sharpen","Saturation","Hue","Temp"].forEach(n=>{
+    $("fx"+n).value = 0; $("v"+n).textContent = 0;
+  });
+  $("fxRecolor").value = "none";
+  $("duotoneRow").classList.remove("show");
+  document.querySelectorAll(".artChoice").forEach(o=>o.classList.remove("active"));
+  document.querySelector('.artChoice[data-fx="none"]').classList.add("active");
+  document.querySelectorAll(".artParam").forEach(o=>o.classList.remove("show"));
+  if (rerender) scheduleRender();
+}
+
+/* =========================================================================
+   Toolbar wiring
+   ========================================================================= */
+document.querySelectorAll(".tbtn[data-tool]:not(#toolCrop)").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    if (!state.hasImage) return;
+    if (state.tool === "crop" && state.cropRect) { state.cropRect=null; }
+    setTool(btn.dataset.tool);
+    drawOverlay();
+  });
+});
+$("toolCrop").addEventListener("click", ()=>{
+  if (!state.hasImage) return;
+  if (hasValidCropRect()){
+    applyCrop();
+  } else {
+    state.cropRect = null;
+    setTool("crop");
+    drawOverlay();
+  }
+});
+$("brushSize").addEventListener("input", (e)=>{ state.brushSize = Number(e.target.value); });
+$("btnUndo").addEventListener("click", undo);
+$("btnResetMask").addEventListener("click", ()=>{
+  if (!state.hasImage) return;
+  pushUndo();
+  mctx.clearRect(0,0,state.w,state.h);
+  mctx.fillStyle = "#fff";
+  mctx.fillRect(0,0,state.w,state.h);
+  state.bbox = { x:0, y:0, w:state.w, h:state.h };
+  seedInitialSamples(state.bbox);
+  scheduleRender();
+});
+
+$("ghostToggle").addEventListener("change", (e)=>{
+  state.showGhost = e.target.checked;
+  scheduleRender();
+});
+
+$("btnOpen").addEventListener("click", ()=> $("fileInput").click());
+$("btnPaste").addEventListener("click", pasteFromClipboardButton);
+$("fileInput").addEventListener("change", async (e)=>{
+  const f = e.target.files[0];
+  if (!f) return;
+  const img = await loadImageFromBlob(f);
+  setImage(img);
+});
+
+canvasStack.addEventListener("dragover", (e)=>{ e.preventDefault(); });
+canvasStack.parentElement.addEventListener("dragover", (e)=>{ e.preventDefault(); });
+document.addEventListener("drop", async (e)=>{
+  e.preventDefault();
+  const f = [...(e.dataTransfer?.files||[])].find(f=>f.type.startsWith("image/"));
+  if (f){ const img = await loadImageFromBlob(f); setImage(img); }
+});
+
+document.addEventListener("paste", async (e)=>{
+  const items = e.clipboardData?.items || [];
+  for (const item of items){
+    if (item.type.startsWith("image/")){
+      const blob = item.getAsFile();
+      const img = await loadImageFromBlob(blob);
+      setImage(img);
+      break;
+    }
+  }
+});
+
+// Button-triggered clipboard paste, for anyone who finds Ctrl/Cmd+V fiddly
+// (small hands, unfamiliar keyboard shortcuts, etc). Uses the async Clipboard
+// API's read() rather than the "paste" event — this only works because it's
+// called directly from a click handler, which counts as the user gesture
+// browsers require before letting a page read the clipboard programmatically.
+async function pasteFromClipboardButton(){
+  try{
+    const items = await navigator.clipboard.read();
+    for (const item of items){
+      const imgType = item.types.find(t => t.startsWith("image/"));
+      if (imgType){
+        const blob = await item.getType(imgType);
+        const img = await loadImageFromBlob(blob);
+        setImage(img);
+        return;
+      }
+    }
+    flashStatus("No image found on the clipboard.");
+  }catch(err){
+    flashStatus("Couldn't read the clipboard \u2014 try Ctrl/Cmd+V instead.");
+  }
+}
+
+/* =========================================================================
+   Export
+   ========================================================================= */
+async function copyPngToClipboard(){
+  if (!state.hasImage) return;
+  try{
+    const blobPromise = new Promise(res => maskedCanvas.toBlob(res, "image/png"));
+    await navigator.clipboard.write([ new ClipboardItem({ "image/png": blobPromise }) ]);
+    flashStatus("Copied PNG to clipboard.");
+  }catch(err){
+    flashStatus("Couldn't copy automatically — try Download instead.");
+  }
+}
+$("btnCopy").addEventListener("click", copyPngToClipboard);
+$("btnDownload").addEventListener("click", ()=>{
+  if (!state.hasImage) return;
+  maskedCanvas.toBlob((blob)=>{
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "cutout.png";
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+  }, "image/png");
+});
+function flashStatus(msg){
+  const prev = statusHint.textContent;
+  statusHint.textContent = msg;
+  setTimeout(()=>{ if (statusHint.textContent===msg) updateStatus(); }, 1800);
+}
+
+/* =========================================================================
+   Init
+   ========================================================================= */
+updateStatus();
+
+})();
+</script>
+</body>
+</html>
